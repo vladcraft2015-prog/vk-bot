@@ -7,13 +7,14 @@ import vk_api
 from vk_api.longpoll import VkEventType, VkLongPoll
 from vk_api.utils import get_random_id
 
-# --- НАСТРОЙКИ ---
-TOKEN = "vk1.a.OaFbDLV94UVvVZ7gYO2HDmcAgPKgHAia-SgapBrqzX6o9KkXeSOBWY9aksUkFSdTk070LbyADtkn5DXNs0zr2wQMzsfnWoJ264hXvu3uQHNJtDZ3Zt9hCJYlN54eqGv_SPIvw9snSk2y-PbJm05cjO2twvhKQ355-DayrR5k-2D8JWM8Cl93Qi-hjSaXFlGNeDlXGUTo_QbzTK03CtCFLQ"
+# --- НАСТРОЙКИ ЮЗЕРБОТА ---
+# Токен забирается из переменных окружения Bothost (VK_TOKEN)
+TOKEN = os.environ.get("VK_TOKEN", "ВАШ_ТОКЕН_ПОЛЬЗОВАТЕЛЯ")
 ADMIN_ID = 550216110
-DATA_FILE = "bot_data.json"
+DATA_FILE = "runes_data.json"
 
 # ID бесед
-RESET_PEER_ID = 2000000012  # Атраксис: общий чат (отслеживаем события и сброс)
+RESET_PEER_ID = 2000000012  # Общий чат (отслеживание событий ИИ Аврора и сбросов)
 RUNES_PEER_IDS = [2000000011, 2000000013]  # Рабочие чаты сбора рун и анонсов
 
 ASPECTS = ["Мутация", "Стабильность", "Память", "Забвение", "Очищение"]
@@ -48,25 +49,24 @@ def load_data():
                         runes[k] = {"code": v, "time": 0}
                     else:
                         runes[k] = v
-                users = set(data.get("users", []))
-                return runes, users
+                return runes
         except Exception as e:
-            print(f"Ошибка загрузки базы: {e}")
-            return {}, set()
-    return {}, set()
+            print(f"⚠️ Ошибка загрузки базы рун: {e}")
+            return {}
+    return {}
 
 
-def save_data(runes, users):
+def save_data(runes):
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(
-                {"runes": runes, "users": list(users)},
+                {"runes": runes},
                 f,
                 ensure_ascii=False,
                 indent=4,
             )
     except Exception as e:
-        print(f"Ошибка сохранения базы: {e}")
+        print(f"⚠️ Ошибка сохранения базы рун: {e}")
 
 
 def send_msg(peer_id, text):
@@ -98,7 +98,7 @@ def get_status_text(runes):
     return f"📊 Статус рун ({len(runes)}/5):\n\n" + "\n".join(status_lines)
 
 
-def broadcast_notification(users):
+def broadcast_notification():
     message = (
         "@all 🏛 **Алтарь готов к ритуалу!** (Собрано 5/5)\n\n"
         "Найди алтарь в игре и перешли сюда системное сообщение:\n"
@@ -119,22 +119,22 @@ def check_aurora_trigger(fwd_messages, current_time, user_id):
     return None
 
 
-# --- ИНИЦИАЛИЗАЦИЯ ---
+# --- ИНИЦИАЛИЗАЦИЯ ПОЛЬЗОВАТЕЛЯ ---
 vk_session = vk_api.VkApi(token=TOKEN)
 vk = vk_session.get_api()
 
 try:
     group_info = vk.utils.resolveScreenName(screen_name="ai_aurora")
     AURORA_ID = -group_info["object_id"]
-    print(f"✅ ID Авроры (ai_aurora): {AURORA_ID}")
+    print(f"✅ ID игрового бота Аврора (ai_aurora): {AURORA_ID}")
 except Exception as e:
     print(f"⚠️ Ошибка определения ID Авроры: {e}")
     AURORA_ID = None
 
 with data_lock:
-    runes, users = load_data()
+    runes = load_data()
 
-print(f"🤖 Юзербот запущен (Хранилище рун). Админ ID: {ADMIN_ID}")
+print(f"🤖 Юзербот запущен. Админ ID: {ADMIN_ID}")
 
 # --- ОСНОВНОЙ ЦИКЛ (USER LONGPOLL) ---
 longpoll = VkLongPoll(vk_session)
@@ -143,6 +143,7 @@ while True:
     try:
         for event in longpoll.listen():
             if event.type == VkEventType.MESSAGE_NEW:
+                # Игнорируем собственные сообщения аккаунта
                 if event.from_me:
                     continue
 
@@ -164,11 +165,6 @@ while True:
                 if not user_id:
                     continue
 
-                with data_lock:
-                    if peer_id not in users:
-                        users.add(peer_id)
-                        save_data(runes, users)
-
                 fwd_messages = msg.get("fwd_messages", [])
                 if "reply_message" in msg:
                     fwd_messages.append(msg["reply_message"])
@@ -176,7 +172,7 @@ while True:
                 clean_text = text.lower()
 
                 # ----------------------------------------------------
-                # 1. ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ
+                # 1. ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫВ БЕСЕДАХ
                 # ----------------------------------------------------
                 if clean_text in ["/id", "/чат", "/chat"]:
                     send_msg(peer_id, f"🆔 **ID этого чата:** `{peer_id}`")
@@ -186,6 +182,7 @@ while True:
                     "/статус",
                     "/прогресс",
                     "/руны",
+                    "📊 статус рун",
                     "статус рун",
                 ]:
                     with data_lock:
@@ -201,7 +198,7 @@ while True:
 
                     send_msg(
                         peer_id,
-                        f"🏓 **ПОНГ!** Бот работает стабильно.\n⏱ **Время онлайн:** {uptime_str}",
+                        f"🏓 **ПОНГ!** Юзербот работает стабильно.\n⏱ **Время онлайн:** {uptime_str}",
                     )
                     continue
 
@@ -213,7 +210,7 @@ while True:
                             f"🕒 **Обнаружен в:** {last_boss_info['time']}"
                         )
                     else:
-                        msg_text = "ℹ️ Информация о боссах с момента запуска бота ещё не поступала."
+                        msg_text = "ℹ️ Информация о боссах с момента запуска юзербота ещё не поступала."
                     send_msg(peer_id, msg_text)
                     continue
 
@@ -275,7 +272,7 @@ while True:
                                         "code": code,
                                         "time": time.time(),
                                     }
-                                    save_data(runes, users)
+                                    save_data(runes)
                                     status_str = get_status_text(runes)
 
                                     if (
@@ -291,18 +288,18 @@ while True:
                                 send_msg(peer_id, response_text)
 
                                 if trigger_broadcast:
-                                    broadcast_notification(users)
+                                    broadcast_notification()
                         continue
 
                     if clean_text == "/очистить":
                         with data_lock:
                             runes.clear()
-                            save_data(runes, users)
+                            save_data(runes)
                         send_msg(peer_id, "🗑 База рун полностью очищена.")
                         continue
 
                 # ----------------------------------------------------
-                # 3. ОБРАБОТКА ТРИГГЕРА АВРОРЫ (ВЫДАЧА КОМБО)
+                # 3. ОБРАБОТКА ТРИГГЕРА АВРОРЫ (ВЫДАЧА КОМБО ИГРОКУ)
                 # ----------------------------------------------------
                 current_time = time.time()
                 trigger_status = check_aurora_trigger(
@@ -345,10 +342,10 @@ while True:
                 # 4. ОБРАБОТКА ИВЕНТОВ, СБРОСА И СБОРА РУН
                 # ----------------------------------------------------
 
-                # --- 1. АВТО-ОПОВЕЩЕНИЯ ОБ ИВЕНТАХ И СБРОСЕ (Из Общего чата от ИИ Аврора) ---
+                # --- А) АВТО-ОПОВЕЩЕНИЯ ОБ ИВЕНТАХ И СБРОСЕ (Из Общего чата RESET_PEER_ID) ---
                 if peer_id == RESET_PEER_ID and user_id == AURORA_ID:
 
-                    # А) Пробуждение колосса (@online)
+                    # Пробуждение колосса (@online)
                     if "пробудился" in clean_text and "колосс" in clean_text:
                         boss_match = re.search(
                             r"Пробудился\s+([^.\n!]+)", text, re.IGNORECASE
@@ -377,7 +374,7 @@ while True:
                             )
                             send_to_work_chats(colossus_msg)
 
-                    # Б) Колоссальная сущность / Босс на стене (@all)
+                    # Колоссальная сущность / Босс на стене (@all)
                     elif (
                         "колоссальная сущность" in clean_text
                         or "цель операции:" in clean_text
@@ -390,7 +387,7 @@ while True:
                         )
                         send_to_work_chats(event_msg)
 
-                    # В) Аномальные возмущения / Событие на стене (@all)
+                    # Аномальные возмущения (@all)
                     elif "аномальные возмущения" in clean_text:
                         event_msg = (
                             f"@all 🧪 **НОВОЕ СОБЫТИЕ НА СТЕНЕ!**\n"
@@ -400,7 +397,7 @@ while True:
                         )
                         send_to_work_chats(event_msg)
 
-                    # Г) Турнир на Арене (@all)
+                    # Турнир на Арене (@all)
                     elif (
                         "турнир на арене" in clean_text
                         or "распорядителю арены" in clean_text
@@ -412,7 +409,7 @@ while True:
                         )
                         send_to_work_chats(event_msg)
 
-                    # Д) Сброс алтаря
+                    # Сброс алтаря
                     elif any(
                         trigger in clean_text for trigger in RESET_TRIGGERS
                     ):
@@ -423,7 +420,7 @@ while True:
                         with data_lock:
                             old_count = len(runes)
                             runes.clear()
-                            save_data(runes, users)
+                            save_data(runes)
                             status_str = get_status_text(runes)
 
                         response = (
@@ -435,7 +432,7 @@ while True:
                         send_to_work_chats(response)
                         continue
 
-                # --- 2. АВТО-СОХРАНЕНИЕ РУН (Принимаем в рабочих чатах RUNES_PEER_IDS) ---
+                # --- Б) АВТО-СОХРАНЕНИЕ РУН (Принимаем в рабочих чатах RUNES_PEER_IDS) ---
                 if peer_id in RUNES_PEER_IDS:
                     all_to_check = [msg] + fwd_messages
 
@@ -487,7 +484,7 @@ while True:
                                                 "code": code,
                                                 "time": fwd_date,
                                             }
-                                            save_data(runes, users)
+                                            save_data(runes)
                                             status_str = get_status_text(runes)
 
                                             if (
@@ -496,19 +493,19 @@ while True:
                                             ):
                                                 trigger_broadcast = True
 
-                                        # 1. Отправляем скрытое подтверждение в чат
+                                        # Подтверждение сохранения в чат
                                         response_msg = (
                                             f"✅ Аспект «{aspect}» сохранен!\n\n"
                                             f"{status_str}"
                                         )
                                         send_msg(peer_id, response_msg)
 
-                                        # 2. Мгновенно подчищаем исходное сообщение игрока
+                                        # Подчищаем сообщение игрока (если есть права админа в чате)
                                         delete_msg(event.message_id)
 
-                                        # 3. При 5/5 созываем все чаты
+                                        # При сборе 5/5 созываем беседы
                                         if trigger_broadcast:
-                                            broadcast_notification(users)
+                                            broadcast_notification()
                                         break
 
     except Exception as e:
