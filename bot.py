@@ -397,10 +397,11 @@ while True:
                         )
                         send_to_work_chats(event_msg)
 
-                    # Турнир на Арене (@all)
+                    # Турнир на Арене (@all) — срабатывает только на анонс старта
                     elif (
-                        "турнир на арене" in clean_text
-                        or "распорядителю арены" in clean_text
+                        ("турнир на арене" in clean_text or "распорядителю арены" in clean_text)
+                        and "окончен" not in clean_text
+                        and "завершен" not in clean_text
                     ):
                         event_msg = (
                             f"@all 🏟 **ТУРНИР НА АРЕНЕ!**\n"
@@ -408,6 +409,7 @@ while True:
                             f"⚔️ Через 30 минут начинается турнир на арене Хром-Гарна!"
                         )
                         send_to_work_chats(event_msg)
+
 
                     # Сброс алтаря
                     elif any(
