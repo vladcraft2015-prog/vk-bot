@@ -387,8 +387,12 @@ while True:
                         )
                         send_to_work_chats(event_msg)
 
-                    # Аномальные возмущения (@all)
-                    elif "аномальные возмущения" in clean_text:
+                    # Аномальные возмущения (@all) — только при старте
+                    elif (
+                        "аномальные возмущения" in clean_text
+                        and "заверш" not in clean_text
+                        and "изучены" not in clean_text
+                    ):
                         event_msg = (
                             f"@all 🧪 **НОВОЕ СОБЫТИЕ НА СТЕНЕ!**\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
@@ -396,6 +400,7 @@ while True:
                             f"🚀 Пора отправляться на исследование!"
                         )
                         send_to_work_chats(event_msg)
+
 
                     # Турнир на Арене (@all) — срабатывает только на анонс старта
                     elif (
