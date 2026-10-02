@@ -432,9 +432,8 @@ while True:
                         save_data(runes)
                         status_str = get_status_text(runes)
 
-                    response = (
-                        f"🚨 **Алтарь вскрыт! ({reset_time_str})**\n\n"
-                        f"• В общем чате зафиксирован сброс. Локальная база полностью очищена от старых записей.\n"
+                    response = ( 
+                        f"🚨 **Алтарь вскрыт! ({reset_time_str})**\n\n" 
                         f"• База рун полностью очищена (удалено: {old_count}).\n\n"
                     )
                     send_to_work_chats(response)
