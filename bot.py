@@ -13,6 +13,9 @@ from vk_api.utils import get_random_id
 TOKEN = os.environ.get("VK_TOKEN", "ВАШ_ТОКЕН_ПОЛЬЗОВАТЕЛЯ")
 ADMIN_ID = 550216110
 
+# ID сообщества «Атраксис || Текстовая ММОРПГ»
+AURORA_ID = -207204359
+
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "runes_data.json")
@@ -38,6 +41,7 @@ AURORA_TRIGGER = "✍ Введите все 5 руноблоков через п
 
 START_TIME = time.time()
 last_boss_info = None
+last_reset_time = 0  # Время последнего сброса алтаря
 data_lock = threading.Lock()
 
 
@@ -95,7 +99,7 @@ def delete_msg(message_id):
         print(f"⚠️ Не удалось удалить сообщение {message_id}: {e}")
 
 
-# СКРЫТИЕ КОДОВ: Показываем только плюс/минус без рассекречивания значениий
+# СКРЫТИЕ КОДОВ: Показываем только плюс/минус без рассекречивания значений
 def get_status_text(runes):
     status_lines = [f"• {a}: {'+' if a in runes else '-'}" for a in ASPECTS]
     return f"📊 Статус рун ({len(runes)}/5):\n\n" + "\n".join(status_lines)
@@ -128,18 +132,10 @@ def check_aurora_trigger(fwd_messages, current_time, user_id):
 vk_session = vk_api.VkApi(token=TOKEN)
 vk = vk_session.get_api()
 
-try:
-    group_info = vk.utils.resolveScreenName(screen_name="ai_aurora")
-    AURORA_ID = -group_info["object_id"]
-    print(f"✅ ID игрового бота Аврора (ai_aurora): {AURORA_ID}")
-except Exception as e:
-    print(f"⚠️ Ошибка определения ID Авроры: {e}")
-    AURORA_ID = None
-
 with data_lock:
     runes = load_data()
 
-print(f"🤖 Юзербот запущен. Админ ID: {ADMIN_ID}")
+print(f"🤖 Юзербот запущен. Админ ID: {ADMIN_ID}, Aurora ID: {AURORA_ID}")
 
 while True:
     try:
@@ -227,15 +223,14 @@ while True:
                     with data_lock:
                         for a in ASPECTS:
                             if a in runes:
-                                t_str = time.strftime(
-                                    "%H:%M", time.localtime(runes[a]["time"])
-                                )
-                                lines.append(
-                                    f"{a}: {runes[a]['code']} (в {t_str})"
-                                )
+                                val = runes[a]
+                                code_val = val.get("code", "???") if isinstance(val, dict) else str(val)
+                                t_val = val.get("time", 0) if isinstance(val, dict) else 0
+                                t_str = time.strftime("%H:%M", time.localtime(t_val)) if t_val else "время не указано"
+                                lines.append(f"• {a}: `{code_val}` (в {t_str})")
                             else:
-                                lines.append(f"{a}: Нет")
-                    msg_text = "💾 Все собранные коды:\n\n" + "\n".join(lines)
+                                lines.append(f"• {a}: *нет*")
+                    msg_text = "💾 **Все собранные коды (Админ):**\n\n" + "\n".join(lines)
                     send_msg(peer_id, msg_text)
                     continue
 
@@ -290,6 +285,7 @@ while True:
                 if clean_text == "/очистить":
                     with data_lock:
                         runes.clear()
+                        last_reset_time = time.time()
                         save_data(runes)
                     send_msg(peer_id, "🗑 База рун полностью очищена.")
                     continue
@@ -314,7 +310,11 @@ while True:
                 with data_lock:
                     is_complete = len(runes) == len(ASPECTS)
                     combo_str = " ".join(
-                        [runes[a]["code"] for a in ASPECTS if a in runes]
+                        [
+                            (runes[a]["code"] if isinstance(runes[a], dict) else str(runes[a]))
+                            for a in ASPECTS
+                            if a in runes
+                        ]
                     )
                     runes_len = len(runes)
 
@@ -429,25 +429,35 @@ while True:
                     with data_lock:
                         old_count = len(runes)
                         runes.clear()
+                        last_reset_time = time.time()
                         save_data(runes)
-                        status_str = get_status_text(runes)
 
-                    response = ( 
-                        f"🚨 **Алтарь вскрыт! ({reset_time_str})**\n\n" 
-                        f"• База рун полностью очищена (удалено: {old_count}).\n\n"
+                    response = (
+                        f"🚨 **Алтарь вскрыт! ({reset_time_str})**\n\n"
+                        f"• База рун полностью очищена (удалено: {old_count})."
                     )
                     send_to_work_chats(response)
                     continue
 
             # --- Б) АВТО-СОХРАНЕНИЕ РУН (В рабочих чатах RUNES_PEER_IDS) ---
             if peer_id in RUNES_PEER_IDS:
-                all_to_check = [msg] + fwd_messages
+                # 🛡 ВАЖНО: Проверяем ТОЛЬКО пересланные/отвеченные сообщения (fwd_messages),
+                # чтобы полностью исключить простой текст от игроков или копипасту.
+                for fwd in fwd_messages:
+                    # 🛡 1. СТРОГАЯ ЗАЩИТА: Автором источника может быть ТОЛЬКО официальный паблик Атраксис
+                    if AURORA_ID and fwd.get("from_id") != AURORA_ID:
+                        continue
 
-                for fwd in all_to_check:
-                    fwd_text = fwd.get("text", "")
                     fwd_date = fwd.get("date", int(current_time))
+
+                    # 🛡 2. ЗАЩИТА ОТ СТАРЫХ ЛОГОВ: Игнорируем логи, полученные ДО последнего сброса алтаря
+                    if fwd_date <= last_reset_time:
+                        continue
+
+                    fwd_text = fwd.get("text", "")
                     fwd_text_lower = fwd_text.lower()
 
+                    # 🛡 3. Проверка свежести сообщения (не старше 30 минут / 1800 сек)
                     if (current_time - fwd_date) <= 1800 or user_id == ADMIN_ID:
                         if (
                             "реликвия активна" in fwd_text_lower
