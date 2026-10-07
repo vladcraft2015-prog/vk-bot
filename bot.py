@@ -8,21 +8,25 @@ from vk_api.longpoll import VkEventType, VkLongPoll
 from vk_api.utils import get_random_id
 
 # ==========================================
-# ⚙️ НАСТРОЙКИ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# ⚙️ НАСТРОЙКИ И ДАННЫЕ
 # ==========================================
+# Токен VK (берётся из переменной окружения VK_TOKEN или подставьте свой вместо строки ниже)
 TOKEN = os.environ.get("VK_TOKEN", "ВАШ_ТОКЕН_ПОЛЬЗОВАТЕЛЯ")
+
+# ID администратора
 ADMIN_ID = 550216110
 
-# ID сообщества «Атраксис || Текстовая ММОРПГ»
+# ID сообщества Авроры
 AURORA_ID = -207204359
 
+# Путь для сохранения данных
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "runes_data.json")
 
 # ID бесед
-RESET_PEER_ID = 2000000012  # Общий чат (отслеживание событий ИИ Аврора и сбросов)
-RUNES_PEER_IDS = [2000000011, 2000000013]  # Рабочие чаты сбора рун и анонсов
+RESET_PEER_ID = 2000000012  # Общий чат (события и сбросы)
+RUNES_PEER_IDS = [2000000011, 2000000013]  # Рабочие чаты сбора рун
 
 # 5 аспектов рун Атраксиса
 ASPECTS = ["Мутация", "Стабильность", "Память", "Забвение", "Очищение"]
@@ -99,7 +103,6 @@ def delete_msg(message_id):
         print(f"⚠️ Не удалось удалить сообщение {message_id}: {e}")
 
 
-# СКРЫТИЕ КОДОВ: Показываем только плюс/минус без рассекречивания значений
 def get_status_text(runes):
     status_lines = [f"• {a}: {'+' if a in runes else '-'}" for a in ASPECTS]
     return f"📊 Статус рун ({len(runes)}/5):\n\n" + "\n".join(status_lines)
@@ -135,7 +138,7 @@ vk = vk_session.get_api()
 with data_lock:
     runes = load_data()
 
-print(f"🤖 Юзербот запущен. Админ ID: {ADMIN_ID}, Aurora ID: {AURORA_ID}")
+print(f"🤖 Юзербот запущен. Admin ID: {ADMIN_ID} | Aurora ID: {AURORA_ID}")
 
 while True:
     try:
@@ -334,10 +337,30 @@ while True:
             # 4. ОБРАБОТКА ИВЕНТОВ, СБРОСА И СБОРА РУН
             # ----------------------------------------------------
 
-            # --- А) АВТО-ОПОВЕЩЕНИЯ ОБ ИВЕНТАХ И СБРОСЕ (Из RESET_PEER_ID) ---
-            if peer_id == RESET_PEER_ID and (
-                AURORA_ID is None or user_id == AURORA_ID
-            ):
+            # --- А) ИВЕНТЫ И СБРОСЫ (Общий чат RESET_PEER_ID) ---
+            if peer_id == RESET_PEER_ID:
+
+                # Сброс алтаря
+                if any(trigger in clean_text for trigger in RESET_TRIGGERS):
+                    reset_time_str = time.strftime(
+                        "%H:%M:%S", time.localtime()
+                    )
+
+                    if user_id < 0:
+                        AURORA_ID = user_id
+
+                    with data_lock:
+                        old_count = len(runes)
+                        runes.clear()
+                        last_reset_time = time.time()
+                        save_data(runes)
+
+                    response = (
+                        f"🚨 **Алтарь вскрыт! ({reset_time_str})**\n\n"
+                        f"• База рун полностью очищена (удалено: {old_count})."
+                    )
+                    send_to_work_chats(response)
+                    continue
 
                 # Пробуждение колосса (@online)
                 if (
@@ -372,7 +395,7 @@ while True:
                         )
                         send_to_work_chats(colossus_msg)
 
-                # Колоссальная сущность / Босс на стене (@all)
+                # Босс на стене (@all)
                 elif (
                     (
                         "колоссальная сущность" in clean_text
@@ -383,7 +406,7 @@ while True:
                     and "заверш" not in clean_text
                 ):
                     event_msg = (
-                        f"@all 🛑 **БОСС НА СТЕНЕ ГРУППЫ!**\n"
+                        f"@all 🛑 **БОЛЬШОЙ БОСС НА СТЕНЕ!**\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
                         f"👾 В группе пробудился мировой босс!\n"
                         f"⚔️ Переходите к посту на стене и вступайте в бой."
@@ -420,45 +443,25 @@ while True:
                     )
                     send_to_work_chats(event_msg)
 
-                # Сброс алтаря
-                elif any(trigger in clean_text for trigger in RESET_TRIGGERS):
-                    reset_time_str = time.strftime(
-                        "%H:%M:%S", time.localtime()
-                    )
-
-                    with data_lock:
-                        old_count = len(runes)
-                        runes.clear()
-                        last_reset_time = time.time()
-                        save_data(runes)
-
-                    response = (
-                        f"🚨 **Алтарь вскрыт! ({reset_time_str})**\n\n"
-                        f"• База рун полностью очищена (удалено: {old_count})."
-                    )
-                    send_to_work_chats(response)
-                    continue
-
-            # --- Б) АВТО-СОХРАНЕНИЕ РУН (В рабочих чатах RUNES_PEER_IDS) ---
+            # --- Б) СБОР РУН (Рабочие чаты RUNES_PEER_IDS) ---
             if peer_id in RUNES_PEER_IDS:
-                # 🛡 ВАЖНО: Проверяем ТОЛЬКО пересланные/отвеченные сообщения (fwd_messages),
-                # чтобы полностью исключить простой текст от игроков или копипасту.
                 for fwd in fwd_messages:
-                    # 🛡 1. СТРОГАЯ ЗАЩИТА: Автором источника может быть ТОЛЬКО официальный паблик Атраксис
-                    if AURORA_ID and fwd.get("from_id") != AURORA_ID:
+                    fwd_from = fwd.get("from_id", 0)
+
+                    # Принимаем сообщения от игровых ботов (from_id < 0)
+                    if fwd_from >= 0:
                         continue
 
                     fwd_date = fwd.get("date", int(current_time))
 
-                    # 🛡 2. ЗАЩИТА ОТ СТАРЫХ ЛОГОВ: Игнорируем логи, полученные ДО последнего сброса алтаря
+                    # Игнорируем сообщения, отправленные до последнего сброса
                     if fwd_date <= last_reset_time:
                         continue
 
                     fwd_text = fwd.get("text", "")
                     fwd_text_lower = fwd_text.lower()
 
-                    # 🛡 3. Проверка свежести сообщения (не старше 30 минут / 1800 сек)
-                    if (current_time - fwd_date) <= 5000 or user_id == ADMIN_ID:
+                    if (current_time - fwd_date) <= 1800 or user_id == ADMIN_ID:
                         if (
                             "реликвия активна" in fwd_text_lower
                             and "аспект:" in fwd_text_lower
