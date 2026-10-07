@@ -458,7 +458,7 @@ while True:
                     fwd_text_lower = fwd_text.lower()
 
                     # 🛡 3. Проверка свежести сообщения (не старше 30 минут / 1800 сек)
-                    if (current_time - fwd_date) <= 1800 or user_id == ADMIN_ID:
+                    if (current_time - fwd_date) <= 5000 or user_id == ADMIN_ID:
                         if (
                             "реликвия активна" in fwd_text_lower
                             and "аспект:" in fwd_text_lower
