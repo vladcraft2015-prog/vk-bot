@@ -36,6 +36,9 @@ TIMERS_FILE = os.path.join(DATA_DIR, "timers_data.json")
 # ID бесед
 RESET_PEER_ID = 2000000012  # Общий чат (события и сбросы)
 RUNES_PEER_IDS = [2000000011, 2000000013]  # Рабочие чаты сбора рун
+# Куда бот сам присылает итоги недели и месяца (в чат, где за период не было сборов, ничего не придёт).
+# Чтобы слать только игрокам, оставьте тут один ID, например [2000000013]
+TOP_PEER_IDS = list(RUNES_PEER_IDS)
 
 # 5 аспектов рун Атраксиса
 ASPECTS = ["Мутация", "Стабильность", "Память", "Забвение", "Очищение"]
@@ -58,6 +61,9 @@ REMINDER_TTL = 30 * 60    # напоминание с тегом удаляет�
 NOTICE_TTL = 10           # короткие пометки бота удаляются через 10 секунд
 WARNING_TTL = 30          # предупреждения об ошибках разбора
 TIMER_STALE = 2 * 3600    # если бот был выключен дольше, напоминание уже не нужно
+CUSTOM_MIN = 10           # свой таймер: минимум 10 секунд
+CUSTOM_MAX = 24 * 3600    # свой таймер: максимум 24 часа
+CUSTOM_LIMIT = 5          # не больше 5 своих таймеров на игрока в чате
 
 # Московское время (без перехода на летнее/зимнее)
 MSK = timezone(timedelta(hours=3))
@@ -74,6 +80,8 @@ stats = {}        # {"peer_id": [запись, ...]}
 stats_seen = {}   # {"peer_id": {ключи уже учтённых сборов}}
 timers = []       # активные таймеры
 deletions = []    # очередь сообщений бота на удаление
+posted = {}       # за какие периоды уже отправлены итоги: {"week": "2026-10-05", "month": "2026-09"}
+_post_state = {}  # попытки отправки итогов
 
 # Виды таймеров
 KINDS = {
@@ -149,13 +157,16 @@ def _save_json(path, payload):
 
 def load_stats():
     global stats, stats_seen
-    raw = _load_json(STATS_FILE, {}).get("chats", {})
+    data = _load_json(STATS_FILE, {})
+    raw = data.get("chats", {})
     stats = {str(k): list(v) for k, v in raw.items()}
     stats_seen = {k: {r.get("k") for r in v} for k, v in stats.items()}
+    posted.clear()
+    posted.update(data.get("posted", {}))
 
 
 def save_stats():
-    _save_json(STATS_FILE, {"chats": stats})
+    _save_json(STATS_FILE, {"chats": stats, "posted": posted})
 
 
 def load_timers():
@@ -472,7 +483,7 @@ def format_stats(recs, scope_title, period_title):
 # ==========================================
 # 📈 КОМАНДА /стата
 # ==========================================
-STATS_HEADS = ("/стата", "/стат", "/stats", "стата")
+STATS_HEADS = ("/стата", "/стат", "/stats")
 PERIOD_WORDS = {
     "сегодня": "today", "сег": "today", "today": "today",
     "вчера": "yesterday",
@@ -492,13 +503,7 @@ def parse_stats_command(clean_text):
     tokens = clean_text.split()
     if not tokens or tokens[0] not in STATS_HEADS:
         return None
-    slash = tokens[0].startswith("/")
     args = tokens[1:]
-    known = set(PERIOD_WORDS) | SCOPE_WORDS | EXTRA_WORDS
-
-    # «стата» без слэша реагирует только на понятные слова, чтобы не отвечать на обычную болтовню
-    if not slash and any(a not in known for a in args):
-        return None
 
     cmd = {"scope": "me", "period": "today", "reset": False, "error": False}
     for a in args:
@@ -549,6 +554,243 @@ def handle_stats_command(peer_id, user_id, clean_text):
 
 
 # ==========================================
+# 🏆 КОМАНДА /топ
+# ==========================================
+_full_cache = {}
+
+
+def get_full_name(user_id):
+    if user_id in _full_cache:
+        return _full_cache[user_id]
+    name = f"id{user_id}"
+    try:
+        with api_lock:
+            res = vk.users.get(user_ids=user_id)
+        if res:
+            first = (res[0].get("first_name") or "").strip()
+            last = (res[0].get("last_name") or "").strip()
+            name = (first + " " + last).strip() or name
+    except Exception as e:
+        print(f"⚠️ Не удалось получить имя {user_id}: {e}")
+        return name
+    _full_cache[user_id] = name
+    return name
+
+
+TOP_LINE = "━━━━━━━━━━━━━━"
+TOP_USAGE = (
+    "ℹ️ Топ игроков по ресурсам:\n"
+    "/топ — за неделю\n"
+    "/топ месяц — за месяц\n"
+    "/топ всё — за всё время\n"
+    "Ещё: сегодня, вчера"
+)
+TOP_FILLER = {"за", "время"}
+TOP_PERIOD_TITLES = {
+    "today": "Сегодня",
+    "yesterday": "Вчера",
+    "week": "Неделя",
+    "month": "Месяц",
+    "all": "Всё время",
+}
+RU_MONTHS = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
+RU_MONTHS_GEN = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
+def top_rows(peer_id, start, end, limit=10):
+    """Топ игроков чата за период: [(имя, всего ресурсов, фиолетовых)].
+    Сортировка по общему числу ресурсов, при равенстве по фиолетовым."""
+    with stats_lock:
+        recs = list(stats.get(str(peer_id), []))
+    agg = {}
+    for r in recs:
+        if r["t"] < start or (end is not None and r["t"] >= end):
+            continue
+        a = agg.setdefault(r["u"], [0, 0])
+        a[0] += sum(r["g"])
+        a[1] += r["g"][2]
+    rows = [(u, tot, vio) for u, (tot, vio) in agg.items() if tot > 0]
+    rows.sort(key=lambda x: (-x[1], -x[2], x[0]))
+    return [(get_full_name(u), tot, vio) for u, tot, vio in rows[:limit]]
+
+
+def format_top(rows, head):
+    """Две строки на игрока, чтобы всё влезало в экран телефона:
+    🥇 Иван Иванов
+        💎 200 · 🟣 20"""
+    lines = [f"🏆 {head}", TOP_LINE]
+    if not rows:
+        lines.append("Пока нет собранных ресурсов.")
+        return "\n".join(lines)
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (name, tot, vio) in enumerate(rows):
+        mark = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{mark} {name}")
+        lines.append(f"    💎 {tot} · 🟣 {vio}")
+    return "\n".join(lines)
+
+
+def handle_top_command(peer_id, user_id, clean_text):
+    tokens = clean_text.split()
+    if not tokens or tokens[0] not in ("/топ", "/top"):
+        return False
+    args = [a for a in tokens[1:] if a not in TOP_FILLER]
+
+    period = "week"
+    for a in args:
+        if a in PERIOD_WORDS:
+            period = PERIOD_WORDS[a]
+        else:
+            send_msg(peer_id, TOP_USAGE)
+            return True
+
+    start, end, _ = period_range(period, time.time())
+    rows = top_rows(peer_id, start, end)
+    send_msg(peer_id, format_top(rows, f"Топ · {TOP_PERIOD_TITLES[period]}"))
+    return True
+
+
+def week_range_title(monday):
+    sunday = monday + timedelta(days=6)
+    if monday.month == sunday.month:
+        return f"{monday.day}–{sunday.day} {RU_MONTHS_GEN[sunday.month - 1]}"
+    return (
+        f"{monday.day} {RU_MONTHS_GEN[monday.month - 1]} – "
+        f"{sunday.day} {RU_MONTHS_GEN[sunday.month - 1]}"
+    )
+
+
+def send_period_top(start, end, head, footer):
+    """Шлёт итоги периода в чаты, где за него были сборы. True, если отправлено или слать некуда."""
+    sent_any = failed = False
+    for pid in TOP_PEER_IDS:
+        rows = top_rows(pid, start, end)
+        if not rows:
+            continue
+        if send_msg(pid, format_top(rows, head) + "\n\n" + footer):
+            sent_any = True
+        else:
+            failed = True
+    return sent_any or not failed
+
+
+def post_period_tops(now=None):
+    """С воскресенья на понедельник присылает итоги недели, 1-го числа итоги месяца (по Москве).
+    Какой период уже отправлен, помнит в файле, поэтому перезапуск не даёт дублей.
+    При самом первом запуске ничего задним числом не шлёт."""
+    now = time.time() if now is None else now
+    today = datetime.fromtimestamp(now, MSK).replace(hour=0, minute=0, second=0, microsecond=0)
+    this_monday = today - timedelta(days=today.weekday())
+    prev_monday = this_monday - timedelta(days=7)
+    this_month = today.replace(day=1)
+    prev_month = (this_month - timedelta(days=1)).replace(day=1)
+
+    jobs = [
+        (
+            "week",
+            prev_monday.date().isoformat(),
+            prev_monday.timestamp(),
+            this_monday.timestamp(),
+            f"Топ недели · {week_range_title(prev_monday)}",
+            "🔄 Новая неделя началась — счётчик с нуля.",
+        ),
+        (
+            "month",
+            prev_month.strftime("%Y-%m"),
+            prev_month.timestamp(),
+            this_month.timestamp(),
+            f"Топ месяца · {RU_MONTHS[prev_month.month - 1]}",
+            "🔄 Новый месяц начался — счётчик с нуля.",
+        ),
+    ]
+    for kind, key, start, end, head, footer in jobs:
+        with stats_lock:
+            last = posted.get(kind)
+            if last is None:
+                posted[kind] = key
+                save_stats()
+                continue
+            if last == key:
+                continue
+        st = _post_state.get(kind)
+        if st and now < st["next"]:
+            continue
+
+        if send_period_top(start, end, head, footer):
+            with stats_lock:
+                posted[kind] = key
+                save_stats()
+            _post_state.pop(kind, None)
+        else:
+            tries = (st["tries"] if st else 0) + 1
+            if tries >= 5:
+                with stats_lock:
+                    posted[kind] = key
+                    save_stats()
+                _post_state.pop(kind, None)
+            else:
+                _post_state[kind] = {"tries": tries, "next": now + 60}
+
+
+# ==========================================
+# 📖 КОМАНДА /помощь
+# ==========================================
+HELP_USER = (
+    "📖 Команды\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "Просто пересылайте сюда сообщения от Атраксиса: бот сам запишет ресурсы, "
+    "поставит таймер на босса и исследование и удалит ваше сообщение. "
+    "Если приписать к пересланному подпись, сообщение останется.\n\n"
+    "📊 /стата [общая] [сегодня | вчера | неделя | месяц | всё] — статистика сборов\n"
+    "🏆 /топ — топ по ресурсам за неделю, /топ месяц, /топ всё (за всё время)\n"
+    "⏳ /таймеры — ваши активные таймеры\n"
+    "⏰ /таймер 45м кузница — свой таймер (45м, 1ч30м, 90)\n"
+    "🗑 /отмена [босс | исследование | свои] — отменить таймеры\n"
+    "📜 /статус — сколько рун собрано\n"
+    "👹 /босс — последний колосс\n"
+    "🏓 /пинг — проверить, что бот жив"
+)
+
+HELP_ADMIN = (
+    "🛠 Админ-команды\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "💾 /код — все собранные коды рун\n"
+    "➕ /add <аспект> <код> — внести руну вручную\n"
+    "➖ /удалить <аспект> — удалить одну руну\n"
+    "🗑 /очистить — очистить базу рун\n"
+    "📢 /все <текст> — рассылка во все рабочие чаты\n"
+    "🧹 /стата сброс — очистить статистику этого чата\n"
+    "🔎 /кто — перешлите сообщение с этой командой, бот покажет его from_id\n"
+    "🆔 /id — ID этого чата"
+)
+
+
+def handle_help_command(peer_id, user_id, clean_text):
+    tokens = clean_text.split()
+    if not tokens:
+        return False
+    head = tokens[0]
+    if head in ("/админ", "/адм"):
+        admin = True
+    elif head in ("/помощь", "/help", "/команды", "/хелп"):
+        admin = len(tokens) > 1 and tokens[1].startswith("адм")
+    else:
+        return False
+
+    if admin and user_id != ADMIN_ID:
+        send_msg(peer_id, "⛔ У вас нет доступа к этой команде.")
+        return True
+    send_msg(peer_id, HELP_ADMIN if admin else HELP_USER)
+    return True
+
+
+# ==========================================
 # ⏳ ТАЙМЕРЫ (БОСС / ИССЛЕДОВАНИЕ)
 # ==========================================
 def timer_kind(text):
@@ -590,13 +832,144 @@ def set_timer(peer_id, user_id, kind, start, name):
     return "new", due
 
 
-def handle_timer_commands(peer_id, user_id, clean_text):
+RE_DUR = re.compile(r"(\d+)\s*([чмсhms])[а-яёa-z]*")
+UNIT_WORD = re.compile(r"^(ч|час\w*|м|мин\w*|сек\w*|h|hr|hour\w*|m|min\w*|sec\w*)$")
+TIMER_USAGE = (
+    "ℹ️ Формат: /таймер <время> [подпись]\n"
+    "Время: 45м, 1ч30м, 2ч, 90 (минуты), 1:30\n"
+    "Пример: /таймер 45м кузница"
+)
+
+
+def fmt_dur(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h}ч")
+    if m:
+        parts.append(f"{m}м")
+    if s and not h:
+        parts.append(f"{s}с")
+    return " ".join(parts) or "0с"
+
+
+def parse_duration_token(tok):
+    """'45м', '1ч30м', '90' (минуты), '1:30' -> секунды, иначе None."""
+    tok = tok.strip().lower()
+    if not tok:
+        return None
+    if tok.isdigit():
+        return int(tok) * 60
+    m = re.fullmatch(r"(\d+):(\d{2})", tok)
+    if m:
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60
+    pos = total = 0
+    found = False
+    for m in RE_DUR.finditer(tok):
+        if m.start() != pos:
+            return None
+        n, u = int(m.group(1)), m.group(2)
+        total += n * (3600 if u in "чh" else 60 if u in "мm" else 1)
+        pos = m.end()
+        found = True
+    return total if found and pos == len(tok) else None
+
+
+def merge_duration_args(args):
+    """'5 минут' -> '5минут', '1ч 30 мин' -> '1ч', '30мин'. Одиночное «с» секундой не считается."""
+    out = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.isdigit() and i + 1 < len(args) and UNIT_WORD.match(args[i + 1].lower()):
+            out.append(a + args[i + 1])
+            i += 2
+        else:
+            out.append(a)
+            i += 1
+    return out
+
+
+def timer_title(t):
+    if t["kind"] == "custom":
+        return f"⏰ {t.get('label') or 'Таймер'}"
+    info = KINDS[t["kind"]]
+    return f"{info['icon']} {info['title']}"
+
+
+def handle_custom_timer(peer_id, user_id, text):
+    args = merge_duration_args(text.split()[1:])
+    total = None
+    i = 0
+    while i < len(args):
+        tok = args[i].lower()
+        if i > 0 and (tok.isdigit() or ":" in tok):
+            break
+        sec = parse_duration_token(tok)
+        if sec is None:
+            break
+        total = (total or 0) + sec
+        i += 1
+
+    if total is None:
+        send_msg(peer_id, TIMER_USAGE)
+        return True
+    if total < CUSTOM_MIN:
+        send_msg(peer_id, f"⚠️ Минимальное время таймера — {CUSTOM_MIN} секунд.")
+        return True
+    if total > CUSTOM_MAX:
+        send_msg(peer_id, "⚠️ Максимальное время таймера — 24 часа.")
+        return True
+
+    label = " ".join(args[i:]).strip()[:60]
+    now = time.time()
+    name = get_name(user_id)
+    with timers_lock:
+        mine = [
+            t for t in timers
+            if t["peer"] == peer_id and t["user"] == user_id and t["kind"] == "custom"
+        ]
+        if len(mine) >= CUSTOM_LIMIT:
+            full = True
+        else:
+            full = False
+            timers.append({
+                "peer": peer_id,
+                "user": user_id,
+                "kind": "custom",
+                "start": now,
+                "due": now + total,
+                "name": name,
+                "label": label,
+            })
+            save_timers()
+    if full:
+        mid = send_msg(
+            peer_id,
+            f"⚠️ {name}, у вас уже {CUSTOM_LIMIT} своих таймеров. Освободите место: /отмена свои",
+        )
+        schedule_delete(mid, WARNING_TTL)
+        return True
+
+    what = f" «{label}»" if label else ""
+    mid = send_msg(
+        peer_id,
+        f"⏰ {name}, таймер{what} на {fmt_dur(total)}. Напомню в {hhmm(now + total)}.",
+    )
+    schedule_delete(mid, NOTICE_TTL)
+    return True
+
+
+def handle_timer_commands(peer_id, user_id, clean_text, text=None):
     tokens = clean_text.split()
     if not tokens:
         return False
     head = tokens[0]
+    text = text if text is not None else clean_text
 
-    if head in ("/таймеры", "/таймер", "/timers"):
+    if head in ("/таймеры", "/timers"):
         now = time.time()
         with timers_lock:
             mine = [t for t in timers if t["peer"] == peer_id and t["user"] == user_id]
@@ -605,13 +978,15 @@ def handle_timer_commands(peer_id, user_id, clean_text):
             return True
         lines = ["⏳ Ваши таймеры:"]
         for t in sorted(mine, key=lambda x: x["due"]):
-            info = KINDS[t["kind"]]
             lines.append(
-                f"{info['icon']} {info['title']} — в {hhmm(t['due'])} "
+                f"{timer_title(t)} — в {hhmm(t['due'])} "
                 f"(через {fmt_left(t['due'] - now)})"
             )
         send_msg(peer_id, "\n".join(lines))
         return True
+
+    if head in ("/таймер", "/timer"):
+        return handle_custom_timer(peer_id, user_id, text)
 
     if head in ("/отмена", "/cancel"):
         want = None
@@ -620,6 +995,8 @@ def handle_timer_commands(peer_id, user_id, clean_text):
                 want = "boss"
             elif tokens[1].startswith("исслед"):
                 want = "research"
+            elif tokens[1].startswith(("сво", "мои", "тайм")):
+                want = "custom"
         with timers_lock:
             before = len(timers)
             timers[:] = [
@@ -654,10 +1031,15 @@ def scheduler_tick(now=None):
     for t in due:
         if now - t["due"] > TIMER_STALE:
             continue
-        info = KINDS.get(t["kind"])
-        if info is None:
-            continue
-        text = f"[id{t['user']}|{t.get('name') or 'игрок'}], {info['remind']}"
+        who = f"[id{t['user']}|{t.get('name') or 'игрок'}]"
+        if t["kind"] == "custom":
+            label = t.get("label") or ""
+            text = f"⏰ {who}, время вышло" + (f": {label}!" if label else "!")
+        else:
+            info = KINDS.get(t["kind"])
+            if info is None:
+                continue
+            text = f"{who}, {info['remind']}"
         mid = send_msg(t["peer"], text)
         if mid:
             schedule_delete(mid, REMINDER_TTL, now)
@@ -678,6 +1060,12 @@ def scheduler_tick(now=None):
             save_timers()
     for d in ready:
         delete_msg(d["mid"])
+
+    try:
+        post_period_tops(now)
+    except Exception:
+        print("⚠️ Ошибка публикации итогов:")
+        traceback.print_exc()
 
 
 def scheduler_loop():
@@ -844,11 +1232,15 @@ def handle_message(msg):
         send_msg(peer_id, msg_text)
         return
 
-    # Статистика сборов и таймеры работают только в рабочих чатах
+    # Помощь, статистика, топ и таймеры работают только в рабочих чатах
     if peer_id in RUNES_PEER_IDS:
+        if handle_help_command(peer_id, user_id, clean_text):
+            return
         if handle_stats_command(peer_id, user_id, clean_text):
             return
-        if handle_timer_commands(peer_id, user_id, clean_text):
+        if handle_top_command(peer_id, user_id, clean_text):
+            return
+        if handle_timer_commands(peer_id, user_id, clean_text, text):
             return
 
     # ----------------------------------------------------
