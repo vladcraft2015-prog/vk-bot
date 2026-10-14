@@ -69,7 +69,6 @@ CUSTOM_LIMIT = 5          # не больше 5 своих таймеров на
 MSK = timezone(timedelta(hours=3))
 
 START_TIME = time.time()
-last_boss_info = None
 last_reset_time = 0  # Время последнего сброса алтаря
 data_lock = threading.Lock()
 api_lock = threading.Lock()
@@ -297,9 +296,9 @@ def period_range(period, now_ts):
         return (today - timedelta(days=1)).timestamp(), today.timestamp(), "Вчера"
     if period == "week":
         monday = today - timedelta(days=today.weekday())
-        return monday.timestamp(), None, "Неделя (с понедельника)"
+        return monday.timestamp(), None, "Неделя"
     if period == "month":
-        return today.replace(day=1).timestamp(), None, "Месяц (с 1 числа)"
+        return today.replace(day=1).timestamp(), None, "Месяц"
     return 0, None, "Всё время"
 
 
@@ -439,44 +438,32 @@ def aggregate(recs):
 
 def fmt_pct(part, total):
     pct = (part / total * 100) if total else 0
-    return f"{pct:.2f}".replace(".", ",") + "%"
+    return f"{pct:.1f}".replace(".", ",") + "%"
 
 
 def format_stats(recs, scope_title, period_title):
-    """Одна общая сводка: жилы и исследования объединены."""
+    """Одна общая сводка. Строки короткие, чтобы не переносились в узком пузыре сообщения."""
     agg = aggregate(recs)
     v, r = agg["v"], agg["r"]
     c = v["c"] + r["c"]
     g = [v["g"][i] + r["g"][i] for i in range(3)]
-    bg = v["bg"] + r["bg"]
+    bonus = v["bg"] + r["bg"] + v["bs"] + r["bs"]
     sph = v["s"] + r["s"]
-    bs = v["bs"] + r["bs"]
     notes = v["n"] + r["n"]
     signs = v["z"] + r["z"]
     total_res = sum(g)
 
-    head = f"📊 Стата · {scope_title} · {period_title}"
-    line = "━━━━━━━━━━━━━━━━━━"
+    lines = [f"📊 Стата · {scope_title}", period_title, ""]
     if c == 0:
-        return f"{head}\n{line}\nСборов за этот период пока нет."
+        lines.append("Сборов пока нет.")
+        return "\n".join(lines)
 
-    res_bonus = f" (бонусных: {bg})" if bg else ""
-    sph_bonus = f" (бонусных: {bs})" if bs else ""
-    lines = [
-        head,
-        line,
-        f"⛏ Сборов: {c}",
-        "",
-        f"💎 Ресурсов: {total_res}{res_bonus}",
-    ]
-    for i, label in enumerate(GRADE_LABELS):
-        lines.append(f"{label}: {g[i]} — {fmt_pct(g[i], total_res)}")
-    lines += [
-        "",
-        f"📦 Сферы: {sph}{sph_bonus}",
-        f"📜 Заметки: {notes}",
-        f"🎖 Знаки: {signs}",
-    ]
+    lines += [f"🔢 Сборов: {c}", f"{PICK} Ресурсов: {total_res}", ""]
+    for emoji, i in (("⚪", 0), ("🔵", 1), ("🟣", 2)):
+        lines.append(f"{emoji} {g[i]} — {fmt_pct(g[i], total_res)}")
+    lines += ["", f"📦 Сферы: {sph}", f"📜 Заметки: {notes}", f"🎖 Знаки: {signs}"]
+    if bonus:
+        lines.append(f"🎁 Бонусных: {bonus}")
     return "\n".join(lines)
 
 
@@ -577,7 +564,7 @@ def get_full_name(user_id):
     return name
 
 
-TOP_LINE = "━━━━━━━━━━━━━━"
+PICK = "\u26cf\ufe0f"  # ⛏️ значок ресурсов
 TOP_USAGE = (
     "ℹ️ Топ игроков по ресурсам:\n"
     "/топ — за неделю\n"
@@ -603,6 +590,20 @@ RU_MONTHS_GEN = [
 ]
 
 
+NAME_FIT = 15  # столько символов помещается в строку узкого пузыря сообщения
+
+
+def short_name(full):
+    """Имя и фамилия целиком, если помещаются в строку. Длинные сокращаем: 'Анастасия Вербицкая' -> 'Анастасия В.'."""
+    full = " ".join(full.split())
+    if len(full) <= NAME_FIT:
+        return full
+    parts = full.split()
+    if len(parts) > 1 and not full.startswith("id"):
+        return f"{parts[0][:12]} {parts[1][0]}."
+    return full[:NAME_FIT]
+
+
 def top_rows(peer_id, start, end, limit=10):
     """Топ игроков чата за период: [(имя, всего ресурсов, фиолетовых)].
     Сортировка по общему числу ресурсов, при равенстве по фиолетовым."""
@@ -617,22 +618,22 @@ def top_rows(peer_id, start, end, limit=10):
         a[1] += r["g"][2]
     rows = [(u, tot, vio) for u, (tot, vio) in agg.items() if tot > 0]
     rows.sort(key=lambda x: (-x[1], -x[2], x[0]))
-    return [(get_full_name(u), tot, vio) for u, tot, vio in rows[:limit]]
+    return [(short_name(get_full_name(u)), tot, vio) for u, tot, vio in rows[:limit]]
 
 
 def format_top(rows, head):
-    """Две строки на игрока, чтобы всё влезало в экран телефона:
-    🥇 Иван Иванов
-        💎 200 · 🟣 20"""
-    lines = [f"🏆 {head}", TOP_LINE]
+    """Две строки на игрока, имя на всю ширину пузыря, медаль во второй строке:
+    Иван Иванов
+    🥇 ⛏️ 200 · 🟣 20"""
+    lines = [f"🏆 {head}", ""]
     if not rows:
-        lines.append("Пока нет собранных ресурсов.")
+        lines.append("Пока нет ресурсов.")
         return "\n".join(lines)
     medals = ["🥇", "🥈", "🥉"]
     for i, (name, tot, vio) in enumerate(rows):
         mark = medals[i] if i < 3 else f"{i + 1}."
-        lines.append(f"{mark} {name}")
-        lines.append(f"    💎 {tot} · 🟣 {vio}")
+        lines.append(name)
+        lines.append(f"{mark} {PICK} {tot} · 🟣 {vio}")
     return "\n".join(lines)
 
 
@@ -697,16 +698,16 @@ def post_period_tops(now=None):
             prev_monday.date().isoformat(),
             prev_monday.timestamp(),
             this_monday.timestamp(),
-            f"Топ недели · {week_range_title(prev_monday)}",
-            "🔄 Новая неделя началась — счётчик с нуля.",
+            f"Топ недели\n{week_range_title(prev_monday)}",
+            "🔄 Новая неделя — счётчик с нуля.",
         ),
         (
             "month",
             prev_month.strftime("%Y-%m"),
             prev_month.timestamp(),
             this_month.timestamp(),
-            f"Топ месяца · {RU_MONTHS[prev_month.month - 1]}",
-            "🔄 Новый месяц начался — счётчик с нуля.",
+            f"Топ месяца\n{RU_MONTHS[prev_month.month - 1]}",
+            "🔄 Новый месяц — счётчик с нуля.",
         ),
     ]
     for kind, key, start, end, head, footer in jobs:
@@ -743,7 +744,7 @@ def post_period_tops(now=None):
 # ==========================================
 HELP_USER = (
     "📖 Команды\n"
-    "━━━━━━━━━━━━━━━━━━\n"
+    "\n"
     "Просто пересылайте сюда сообщения от Атраксиса: бот сам запишет ресурсы, "
     "поставит таймер на босса и исследование и удалит ваше сообщение. "
     "Если приписать к пересланному подпись, сообщение останется.\n\n"
@@ -753,13 +754,12 @@ HELP_USER = (
     "⏰ /таймер 45м кузница — свой таймер (45м, 1ч30м, 90)\n"
     "🗑 /отмена [босс | исследование | свои] — отменить таймеры\n"
     "📜 /статус — сколько рун собрано\n"
-    "👹 /босс — последний колосс\n"
     "🏓 /пинг — проверить, что бот жив"
 )
 
 HELP_ADMIN = (
     "🛠 Админ-команды\n"
-    "━━━━━━━━━━━━━━━━━━\n"
+    "\n"
     "💾 /код — все собранные коды рун\n"
     "➕ /add <аспект> <код> — внести руну вручную\n"
     "➖ /удалить <аспект> — удалить одну руну\n"
@@ -979,8 +979,8 @@ def handle_timer_commands(peer_id, user_id, clean_text, text=None):
         lines = ["⏳ Ваши таймеры:"]
         for t in sorted(mine, key=lambda x: x["due"]):
             lines.append(
-                f"{timer_title(t)} — в {hhmm(t['due'])} "
-                f"(через {fmt_left(t['due'] - now)})"
+                f"{timer_title(t)} · {hhmm(t['due'])} "
+                f"({fmt_left(t['due'] - now)})"
             )
         send_msg(peer_id, "\n".join(lines))
         return True
@@ -1174,7 +1174,7 @@ def process_game_forwards(msg, peer_id, user_id, fwd_messages):
 # 📨 ОБРАБОТКА ОДНОГО СООБЩЕНИЯ
 # ==========================================
 def handle_message(msg):
-    global last_boss_info, last_reset_time
+    global last_reset_time
 
     text = msg.get("text", "").strip()
     user_id = msg.get("from_id")
@@ -1218,18 +1218,6 @@ def handle_message(msg):
             peer_id,
             f"🏓 **ПОНГ!** Юзербот работает стабильно.\n⏱ **Время онлайн:** {uptime_str}",
         )
-        return
-
-    if clean_text in ["/босс", "/boss", "/координаты"]:
-        if last_boss_info:
-            msg_text = (
-                f"👹 **Последний колосс:** {last_boss_info['name']}\n"
-                f"📍 **Координаты:** `{last_boss_info['coords']}`\n"
-                f"🕒 **Обнаружен в:** {last_boss_info['time']}"
-            )
-        else:
-            msg_text = "ℹ️ Информация о боссах с момента запуска юзербота ещё не поступала."
-        send_msg(peer_id, msg_text)
         return
 
     # Помощь, статистика, топ и таймеры работают только в рабочих чатах
@@ -1455,12 +1443,6 @@ def handle_message(msg):
             if boss_match and coords_match:
                 boss_name = boss_match.group(1).strip()
                 coords = coords_match.group(1).strip()
-
-                last_boss_info = {
-                    "name": boss_name,
-                    "coords": coords,
-                    "time": time.strftime("%H:%M", time.localtime()),
-                }
 
                 colossus_msg = (
                     f"@online ☄️ **ОБНАРУЖЕНА УГРОЗА!**\n"
