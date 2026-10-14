@@ -288,7 +288,7 @@ def period_range(period, now_ts):
         monday = today - timedelta(days=today.weekday())
         return monday.timestamp(), None, "Неделя (с понедельника)"
     if period == "month":
-        return today.replace(day=1).timestamp(), None, "Месяц"
+        return today.replace(day=1).timestamp(), None, "Месяц (с 1 числа)"
     return 0, None, "Всё время"
 
 
@@ -383,8 +383,9 @@ def make_key(user_id, fdate, ftext):
 
 
 def add_stat_records(peer_id, recs):
-    """Добавляет записи в статистику чата. Возвращает (добавлено, дубликатов)."""
-    added = dupes = 0
+    """Добавляет записи в статистику чата. Возвращает (список добавленных записей, число дубликатов)."""
+    added = []
+    dupes = 0
     key = str(peer_id)
     with stats_lock:
         bucket = stats.setdefault(key, [])
@@ -395,10 +396,15 @@ def add_stat_records(peer_id, recs):
                 continue
             seen.add(rec["k"])
             bucket.append(rec)
-            added += 1
+            added.append(rec)
         if added:
             save_stats()
     return added, dupes
+
+
+def fmt_recorded(name, recs):
+    """Короткая пометка о записанных сборах (без подробностей)."""
+    return "✅ Ресурсы записаны"
 
 
 def aggregate(recs):
@@ -425,47 +431,41 @@ def fmt_pct(part, total):
     return f"{pct:.2f}".replace(".", ",") + "%"
 
 
-def _mode_block(title, a):
-    total_res = sum(a["g"])
-    lines = [f"{title} · сборов: {a['c']}"]
-    bonus = f" (бонусных: {a['bg']})" if a["bg"] else ""
-    lines.append(f"Ресурсов: {total_res}{bonus}")
-    for i, label in enumerate(GRADE_LABELS):
-        lines.append(f"{label}: {a['g'][i]} — {fmt_pct(a['g'][i], total_res)}")
-    sph_bonus = f" (бонусных: {a['bs']})" if a["bs"] else ""
-    lines.append(f"📦 Сферы: {a['s']}{sph_bonus}")
-    lines.append(f"📜 Заметки: {a['n']}")
-    lines.append(f"🎖 Знаки: {a['z']}")
-    return lines
-
-
 def format_stats(recs, scope_title, period_title):
-    head = f"📊 Стата · {scope_title} · {period_title}"
+    """Одна общая сводка: жилы и исследования объединены."""
     agg = aggregate(recs)
-    total_c = agg["v"]["c"] + agg["r"]["c"]
-    if total_c == 0:
-        return head + "\n\nСборов за этот период пока нет."
+    v, r = agg["v"], agg["r"]
+    c = v["c"] + r["c"]
+    g = [v["g"][i] + r["g"][i] for i in range(3)]
+    bg = v["bg"] + r["bg"]
+    sph = v["s"] + r["s"]
+    bs = v["bs"] + r["bs"]
+    notes = v["n"] + r["n"]
+    signs = v["z"] + r["z"]
+    total_res = sum(g)
 
-    lines = [head, "", f"Всего сборов: {total_c}"]
-    if agg["v"]["c"]:
-        lines.append("")
-        lines += _mode_block("⛏ Жилы", agg["v"])
-    if agg["r"]["c"]:
-        lines.append("")
-        lines += _mode_block("🔬 Исследование", agg["r"])
+    head = f"📊 Стата · {scope_title} · {period_title}"
+    line = "━━━━━━━━━━━━━━━━━━"
+    if c == 0:
+        return f"{head}\n{line}\nСборов за этот период пока нет."
 
-    if agg["v"]["c"] and agg["r"]["c"]:
-        both = {
-            "c": total_c,
-            "g": [agg["v"]["g"][i] + agg["r"]["g"][i] for i in range(3)],
-            "bg": agg["v"]["bg"] + agg["r"]["bg"],
-            "s": agg["v"]["s"] + agg["r"]["s"],
-            "bs": agg["v"]["bs"] + agg["r"]["bs"],
-            "n": agg["v"]["n"] + agg["r"]["n"],
-            "z": agg["v"]["z"] + agg["r"]["z"],
-        }
-        lines.append("")
-        lines += _mode_block("📦 Итого", both)
+    res_bonus = f" (бонусных: {bg})" if bg else ""
+    sph_bonus = f" (бонусных: {bs})" if bs else ""
+    lines = [
+        head,
+        line,
+        f"⛏ Сборов: {c}",
+        "",
+        f"💎 Ресурсов: {total_res}{res_bonus}",
+    ]
+    for i, label in enumerate(GRADE_LABELS):
+        lines.append(f"{label}: {g[i]} — {fmt_pct(g[i], total_res)}")
+    lines += [
+        "",
+        f"📦 Сферы: {sph}{sph_bonus}",
+        f"📜 Заметки: {notes}",
+        f"🎖 Знаки: {signs}",
+    ]
     return "\n".join(lines)
 
 
@@ -741,37 +741,43 @@ def process_game_forwards(msg, peer_id, user_id, fwd_messages):
         return False
 
     added, dupes = add_stat_records(peer_id, new_recs)
+    name = get_name(user_id)
 
-    lines = []
+    notices = []   # короткие пометки без тега, исчезают через несколько секунд
+    tagged = []    # сообщения с тегом (должны прийти уведомлением и повисеть)
+
     if added:
-        s = f"✅ +{added}"
+        text_ok = fmt_recorded(name, added)
         if dupes:
-            s += f" (уже было: {dupes})"
-        lines.append(s)
+            text_ok += f"\n(уже было: {dupes})"
+        notices.append(text_ok)
     elif dupes:
-        lines.append(f"ℹ️ Уже учтено: {dupes}")
+        notices.append(f"ℹ️ {name}, это уже учтено ({dupes})")
     if unparsed:
-        lines.append(f"⚠️ Не смог разобрать сообщений: {unparsed}. Они остались в чате.")
+        notices.append(f"⚠️ Не смог разобрать сообщений: {unparsed}. Они остались в чате.")
 
-    if timer_events:
-        name = get_name(user_id)
-        for kind, fdate in timer_events:
-            info = KINDS[kind]
-            status, due = set_timer(peer_id, user_id, kind, fdate, name)
-            if status == "new":
-                lines.append(f"{info['icon']} {name}, {info['logged']}. Напомню в {hhmm(due)}.")
-            elif status == "dupe":
-                lines.append(f"ℹ️ {name}, этот таймер уже стоит (в {hhmm(due)}).")
-            else:
-                lines.append(f"{info['icon']} {name}, час уже прошёл — {info['late']}!")
+    for kind, fdate in timer_events:
+        info = KINDS[kind]
+        status, due = set_timer(peer_id, user_id, kind, fdate, name)
+        if status == "new":
+            notices.append(f"{info['icon']} {name}, {info['logged']}. Напомню в {hhmm(due)}.")
+        elif status == "dupe":
+            notices.append(f"ℹ️ {name}, этот таймер уже стоит (в {hhmm(due)}).")
+        else:
+            tagged.append(f"{info['icon']} [id{user_id}|{name}], час уже прошёл — {info['late']}!")
 
-    if lines:
-        ttl = WARNING_TTL if unparsed else NOTICE_TTL
-        mid = send_msg(peer_id, "\n".join(lines))
-        schedule_delete(mid, ttl)
+    if notices:
+        mid = send_msg(peer_id, "\n\n".join(notices))
+        schedule_delete(mid, WARNING_TTL if unparsed else NOTICE_TTL)
 
-    # Свои пересланные сообщения удаляем, но если что-то не разобралось, оставляем как есть
-    if unparsed == 0:
+    for line in tagged:
+        mid = send_msg(peer_id, line)
+        schedule_delete(mid, REMINDER_TTL)
+
+    # Своё пересланное сообщение удаляем только если оно «голое»: без подписи и всё разобрано.
+    # Если игрок что-то приписал («круто!», хвастаемся), сообщение остаётся, но сбор всё равно записан.
+    has_caption = bool((msg.get("text") or "").strip())
+    if unparsed == 0 and not has_caption:
         delete_msg(msg.get("id"))
     return True
 
