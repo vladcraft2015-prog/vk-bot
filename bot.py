@@ -453,7 +453,9 @@ def format_stats(recs, scope_title, period_title):
     signs = v["z"] + r["z"]
     total_res = sum(g)
 
-    lines = [f"📊 Стата · {scope_title}", period_title, ""]
+    # Первая строка длинная и без эмодзи: VK тянет пузырь по самой длинной строке,
+    # а строки с эмодзи считает уже, чем рисует, и переносит их.
+    lines = [f"Стата · {scope_title} · {period_title}", ""]
     if c == 0:
         lines.append("Сборов пока нет.")
         return "\n".join(lines)
@@ -590,7 +592,7 @@ RU_MONTHS_GEN = [
 ]
 
 
-NAME_FIT = 15  # столько символов помещается в строку узкого пузыря сообщения
+NAME_FIT = 18  # столько символов помещается в строку узкого пузыря сообщения
 
 
 def short_name(full):
@@ -625,7 +627,7 @@ def format_top(rows, head):
     """Две строки на игрока, имя на всю ширину пузыря, медаль во второй строке:
     Иван Иванов
     🥇 ⛏️ 200 · 🟣 20"""
-    lines = [f"🏆 {head}", ""]
+    lines = [head, ""]
     if not rows:
         lines.append("Пока нет ресурсов.")
         return "\n".join(lines)
@@ -653,7 +655,7 @@ def handle_top_command(peer_id, user_id, clean_text):
 
     start, end, _ = period_range(period, time.time())
     rows = top_rows(peer_id, start, end)
-    send_msg(peer_id, format_top(rows, f"Топ · {TOP_PERIOD_TITLES[period]}"))
+    send_msg(peer_id, format_top(rows, f"Топ игроков · {TOP_PERIOD_TITLES[period]}"))
     return True
 
 
@@ -698,7 +700,7 @@ def post_period_tops(now=None):
             prev_monday.date().isoformat(),
             prev_monday.timestamp(),
             this_monday.timestamp(),
-            f"Топ недели\n{week_range_title(prev_monday)}",
+            f"Топ недели · {week_range_title(prev_monday)}",
             "🔄 Новая неделя — счётчик с нуля.",
         ),
         (
@@ -706,7 +708,7 @@ def post_period_tops(now=None):
             prev_month.strftime("%Y-%m"),
             prev_month.timestamp(),
             this_month.timestamp(),
-            f"Топ месяца\n{RU_MONTHS[prev_month.month - 1]}",
+            f"Топ месяца · {RU_MONTHS[prev_month.month - 1]}",
             "🔄 Новый месяц — счётчик с нуля.",
         ),
     ]
@@ -976,7 +978,7 @@ def handle_timer_commands(peer_id, user_id, clean_text, text=None):
         if not mine:
             send_msg(peer_id, "⏳ У вас нет активных таймеров.")
             return True
-        lines = ["⏳ Ваши таймеры:"]
+        lines = ["Ваши активные таймеры:"]
         for t in sorted(mine, key=lambda x: x["due"]):
             lines.append(
                 f"{timer_title(t)} · {hhmm(t['due'])} "
