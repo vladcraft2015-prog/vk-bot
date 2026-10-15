@@ -797,7 +797,7 @@ def handle_help_command(peer_id, user_id, clean_text):
 # ==========================================
 def timer_kind(text):
     low = text.lower()
-    if "⚔️ Урон по боссу" in low:
+    if "урон по боссу" in low:
         return "boss"
     if "следующее исследование" in low:
         return "research"
