@@ -1,1617 +1,696 @@
-import hashlib
-import json
+import sys
+sys.stdout.reconfigure(line_buffering=True)
+import time
+import random
 import os
 import re
-import threading
-import time
-import traceback
-from datetime import datetime, timedelta, timezone
+import requests
+import json
+from datetime import datetime, timedelta
 
-import vk_api
-from vk_api.longpoll import VkEventType, VkLongPoll
-from vk_api.utils import get_random_id
+# ============================== НАСТРОЙКИ ==============================
+VK_TOKEN = "vk1.a.ho5aCqOq4D7SaDwU6bJXeLccijn5JKvPTCbNGDUh0iOlgY3sFToACnycXIys6EVCYUt43Qe6sxREVHWxwDUwKBhpBg8xq8Z6_t9kjamyxViREIlRF5ZYDQ5TMvju--Mlnn8AG9yBTG8fQ6bpxoafEEFjbGelmjrLH805vnqyT-uxRLi4K8DcS04iiKgzPe_DIJZahi-VVdlxPlpFHMbgyg"   # лучше хранить в переменной окружения
+VK_API_VERSION = "5.131"
+MY_USER_ID = 550216110          # ваш ID для чтения команд из Избранного
+HISTORY_FILE = "purchase_history.json"
+MATRICES_FILE = "target_matrices.json"
 
-# ==========================================
-# ⚙️ НАСТРОЙКИ И ДАННЫЕ
-# ==========================================
-# Токен VK (берётся из переменной окружения VK_TOKEN или подставьте свой вместо строки ниже)
-TOKEN = os.environ.get("VK_TOKEN", "ВАШ_ТОКЕН_ПОЛЬЗОВАТЕЛЯ")
+CONFIRM_WAIT = 25               # сколько секунд ждать ответ лавки после последнего действия
+CONFIRM_MAX_PRESSES = 3         # сколько раз подряд можно нажать «Подтвердить» (цена могла обновиться)
+MAX_BUY_ATTEMPTS = 5            # защита от бесконечного цикла корректировок заказа
 
-# ID администратора
-ADMIN_ID = 550216110
-
-# ID сообщества ИИ Авроры (события в общем чате и сброс алтаря)
-AURORA_ID = -235592858
-
-# ID сообщества Атраксис (игра): от него принимаются руны, сборы и таймеры
-ATRAXIS_ID = -207204359
-
-# Путь для сохранения данных
-DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
-os.makedirs(DATA_DIR, exist_ok=True)
-DATA_FILE = os.path.join(DATA_DIR, "runes_data.json")
-STATS_FILE = os.path.join(DATA_DIR, "stats_data.json")
-TIMERS_FILE = os.path.join(DATA_DIR, "timers_data.json")
-
-# ID бесед
-RESET_PEER_ID = 2000000012  # Общий чат (события и сбросы)
-RUNES_PEER_IDS = [2000000011, 2000000013]  # Рабочие чаты сбора рун
-# Куда бот сам присылает итоги недели и месяца (в чат, где за период не было сборов, ничего не придёт).
-# Чтобы слать только игрокам, оставьте тут один ID, например [2000000013]
-TOP_PEER_IDS = list(RUNES_PEER_IDS)
-
-# 5 аспектов рун Атраксиса
-ASPECTS = ["Мутация", "Стабильность", "Память", "Забвение", "Очищение"]
-
-RESET_TRIGGERS = [
-    "рунический свет погас",
-    "разгадал символы",
-    "символы алтаря",
-    "алтаря",
-    "алтарь сброшен",
-    "ритуал соверш",
-    "ритуал заверш",
+STORES = [
+    {
+        "id": 1, "name": "Dark Requiem", "peer_id": -220647125,
+        "catalog_type": "text", "catalog_cmd": "Скрин", "confirm_mode": "callback", "disabled": False
+    },
+    {
+        "id": 2, "name": "Алый Рассвет", "peer_id": -236362151,
+        "catalog_type": "text", "catalog_cmd": "⭐ Ждун", "disabled": False
+    },
+    {
+        "id": 3, "name": "Сердце Времени", "peer_id": -233363345,
+        "catalog_type": "payload", "my_label": "❤️ Моё",
+        "my_payload": {"guild_store": 1, "screen": "main", "button": "favorites"},
+        "disabled": False
+    },
+    {
+        "id": 4, "name": "Arcana Market", "peer_id": -239812778,
+        "catalog_type": "payload", "my_label": "🎒 Моё",
+        "my_payload": {"action": "shop.mine"}, "confirm_mode": "message", "disabled": False
+    },
 ]
 
-AURORA_TRIGGER = "✍ Введите все 5 руноблоков через пробел. Порядок не важен. Есть лишь один шанс..."
+SUCCESS_KEYWORDS = ["куплено за", "результат сделки", "списано:", "покупка завершена", "куплено:"]
+# слова, по которым понятно, что лавка дала окончательный ответ
+FINAL_MARKERS = SUCCESS_KEYWORDS + ["нет на складе", "доступно:", "недостаточно", "нужно"]
 
-# --- Таймеры и автоудаление ---
-TIMER_SECONDS = 3600      # до следующего удара по боссу / исследования всегда час
-REMINDER_TTL = 30 * 60    # напоминание с тегом удаляется через 30 минут
-NOTICE_TTL = 10           # короткие пометки бота удаляются через 10 секунд
-WARNING_TTL = 30          # предупреждения об ошибках разбора
-TIMER_STALE = 2 * 3600    # если бот был выключен дольше, напоминание уже не нужно
-CUSTOM_MIN = 10           # свой таймер: минимум 10 секунд
-CUSTOM_MAX = 24 * 3600    # свой таймер: максимум 24 часа
-CUSTOM_LIMIT = 5          # не больше 5 своих таймеров на игрока в чате
-
-# Московское время (без перехода на летнее/зимнее)
-MSK = timezone(timedelta(hours=3))
-
-START_TIME = time.time()
-last_reset_time = 0  # Время последнего сброса алтаря
-data_lock = threading.Lock()
-api_lock = threading.Lock()
-stats_lock = threading.Lock()
-timers_lock = threading.RLock()
-
-stats = {}        # {"peer_id": [запись, ...]}
-stats_seen = {}   # {"peer_id": {ключи уже учтённых сборов}}
-timers = []       # активные таймеры
-deletions = []    # очередь сообщений бота на удаление
-posted = {}       # за какие периоды уже отправлены итоги: {"week": "2026-10-05", "month": "2026-09"}
-_post_state = {}  # попытки отправки итогов
-
-# Виды таймеров
-KINDS = {
-    "boss": {
-        "icon": "⚔️",
-        "logged": "удар по боссу записан",
-        "late": "можно бить босса",
-        "remind": "пора бить босса! ⚔️",
-        "title": "Босс",
-    },
-    "research": {
-        "icon": "🔬",
-        "logged": "исследование записано",
-        "late": "можно исследовать",
-        "remind": "пора на исследование! 🔬",
-        "title": "Исследование",
-    },
-}
-
-GRADE_LABELS = ["⚪ Серых (I)", "🔵 Синих (II)", "🟣 Фиолетовых (III)"]
-ROMAN = {"I": 0, "II": 1, "III": 2}
+last_check_time = "Ещё не проводилась"
+last_processed_msg_id = 0
 
 
-# ==========================================
-# 🛠 ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ==========================================
-def load_data():
-    if os.path.exists(DATA_FILE):
+# ============================== ХРАНИЛИЩЕ ==============================
+def load_json(file_path, default):
+    if os.path.exists(file_path):
         try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                raw_runes = data.get("runes", {})
-                runes = {}
-                for k, v in raw_runes.items():
-                    if isinstance(v, str):
-                        runes[k] = {"code": v, "time": 0}
-                    else:
-                        runes[k] = v
-                return runes
-        except Exception as e:
-            print(f"⚠️ Ошибка загрузки базы рун: {e}")
-            return {}
-    return {}
-
-
-def save_data(runes):
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump({"runes": runes}, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        print(f"⚠️ Ошибка сохранения базы рун: {e}")
-
-
-def _load_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(file_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"⚠️ Ошибка загрузки {os.path.basename(path)}: {e}")
+            print(f"⚠️ Ошибка чтения {file_path}: {e}")
     return default
 
 
-def _save_json(path, payload):
-    tmp = path + ".tmp"
+def save_json(file_path, data):
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"⚠️ Ошибка сохранения {os.path.basename(path)}: {e}")
+        print(f"⚠️ Ошибка сохранения {file_path}: {e}")
 
 
-def load_stats():
-    global stats, stats_seen
-    data = _load_json(STATS_FILE, {})
-    raw = data.get("chats", {})
-    stats = {str(k): list(v) for k, v in raw.items()}
-    stats_seen = {k: {r.get("k") for r in v} for k, v in stats.items()}
-    posted.clear()
-    posted.update(data.get("posted", {}))
+purchase_history = load_json(HISTORY_FILE, [])
+target_matrices = load_json(MATRICES_FILE, [
+    {"name": "Грави-всплеск", "stores": [1, 2, 3, 4]}
+])
 
 
-def save_stats():
-    _save_json(STATS_FILE, {"chats": stats, "posted": posted})
-
-
-def load_timers():
-    global timers, deletions
-    raw = _load_json(TIMERS_FILE, {})
-    timers = list(raw.get("timers", []))
-    deletions = list(raw.get("deletions", []))
-
-
-def save_timers():
-    _save_json(TIMERS_FILE, {"timers": timers, "deletions": deletions})
-
-
-def send_msg(peer_id, text):
-    """Отправляет сообщение. Возвращает id отправленного сообщения или None."""
-    try:
-        params = {
-            "peer_id": peer_id,
-            "message": text,
-            "random_id": get_random_id(),
-        }
-        with api_lock:
-            res = vk.messages.send(**params)
-        return res if isinstance(res, int) else None
-    except Exception as e:
-        print(f"⚠️ Ошибка отправки в {peer_id}: {e}")
+# ============================== VK API ==============================
+def vk_api_request(method, params=None, retries=3):
+    if not VK_TOKEN:
+        print("⚠️ Ошибка: VK_TOKEN пустой!")
         return None
+    params = dict(params or {})
+    params['access_token'] = VK_TOKEN
+    params['v'] = VK_API_VERSION
+    url = f"https://api.vk.ru/method/{method}"
 
-
-def send_to_work_chats(text):
-    for pid in RUNES_PEER_IDS:
-        send_msg(pid, text)
-
-
-def delete_msg(message_id):
-    if not message_id:
-        return False
-    try:
-        with api_lock:
-            vk.messages.delete(message_ids=[message_id], delete_for_all=1)
-        return True
-    except Exception as e:
-        print(f"⚠️ Не удалось удалить сообщение {message_id}: {e}")
-        return False
-
-
-def schedule_delete(message_id, delay, now=None):
-    """Ставит собственное сообщение бота в очередь на удаление через delay секунд."""
-    if not message_id:
-        return
-    now = time.time() if now is None else now
-    with timers_lock:
-        deletions.append({"mid": message_id, "at": now + delay})
-        save_timers()
-
-
-_name_cache = {}
-
-
-def get_name(user_id):
-    if user_id in _name_cache:
-        return _name_cache[user_id]
-    name = "игрок"
-    try:
-        with api_lock:
-            res = vk.users.get(user_ids=user_id)
-        if res:
-            name = res[0].get("first_name") or name
-    except Exception as e:
-        print(f"⚠️ Не удалось получить имя {user_id}: {e}")
-        return name
-    _name_cache[user_id] = name
-    return name
-
-
-def get_status_text(runes):
-    status_lines = [f"• {a}: {'+' if a in runes else '-'}" for a in ASPECTS]
-    return f"📊 Статус рун ({len(runes)}/5):\n\n" + "\n".join(status_lines)
-
-
-def broadcast_notification():
-    message = (
-        "@all 🏛 **Алтарь готов к ритуалу!** (Собрано 5/5)\n\n"
-        "Найди алтарь в игре и перешли сюда системное сообщение:\n"
-        "«✍ Введите все 5 руноблоков через пробел. Порядок не важен. Есть лишь один шанс...»\n\n"
-        "Бот мгновенно выдаст тебе все руноблоки 📜"
-    )
-    send_to_work_chats(message)
-
-
-def check_aurora_trigger(fwd_messages, current_time, user_id):
-    for fwd in fwd_messages:
-        if AURORA_TRIGGER in fwd.get("text", ""):
-            fwd_date = fwd.get("date", 0)
-            if (current_time - fwd_date) <= 900 or user_id == ADMIN_ID:
-                return "VALID"
-            else:
-                return "EXPIRED"
+    for attempt in range(1, retries + 1):
+        try:
+            return requests.post(url, data=params, timeout=15).json()
+        except Exception as e:
+            print(f"⚠️ Сетевая ошибка VK API ({method}), попытка {attempt}/{retries}: {e}")
+            if attempt < retries:
+                time.sleep(3)
     return None
 
 
-# ==========================================
-# 🕒 ВРЕМЯ (МОСКВА)
-# ==========================================
-def hhmm(ts):
-    return datetime.fromtimestamp(ts, MSK).strftime("%H:%M")
+def send_message(peer_id, message=" ", payload=None):
+    message = message or " "
+    print(f"📤 Отправка в peer {peer_id}: «{message}» (payload: {payload is not None})")
 
-
-def fmt_left(seconds):
-    seconds = max(0, int(seconds))
-    h, rem = divmod(seconds, 3600)
-    m = rem // 60
-    if h:
-        return f"{h}ч {m}м"
-    if m:
-        return f"{m}м"
-    return "меньше минуты"
-
-
-def period_range(period, now_ts):
-    """Возвращает (начало, конец или None, название) периода по Москве.
-    Неделя начинается с понедельника 00:00, то есть сбрасывается с воскресенья на понедельник."""
-    now = datetime.fromtimestamp(now_ts, MSK)
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    if period == "today":
-        return today.timestamp(), None, "Сегодня"
-    if period == "yesterday":
-        return (today - timedelta(days=1)).timestamp(), today.timestamp(), "Вчера"
-    if period == "week":
-        monday = today - timedelta(days=today.weekday())
-        return monday.timestamp(), None, "Неделя"
-    if period == "month":
-        return today.replace(day=1).timestamp(), None, "Месяц"
-    return 0, None, "Всё время"
-
-
-# ==========================================
-# ⛏ РАЗБОР СООБЩЕНИЙ ИГРЫ (СБОРЫ)
-# ==========================================
-RE_BRACKET = re.compile(r"\[\s*(III|II|I)\s*\]")
-RE_TRAIL = re.compile(r"\s(III|II|I)\s*[.!]?\s*$")
-
-
-def is_gather_start(text):
-    return "сбор начат" in text.lower()
-
-
-def parse_gather(text):
-    """Разбирает результат сбора. Возвращает None, если это не результат сбора.
-    Грейд (серый/синий/фиолетовый) берётся по цифре I/II/III, а не по цвету кружка."""
-    low = text.lower()
-    if "собрано:" in low:
-        mode = "v"  # Жилы (сбор с локации)
-    elif "вы добыли ресурсы" in low:
-        mode = "r"  # Исследование (жила, найденная в исследовании)
-    else:
-        return None
-
-    res = []
-    spheres = notes = signs = 0
-    dup_line = None
-
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        l = line.lower()
-
-        if "бонусы дублируют" in l:
-            dup_line = l
-            continue
-
-        m = RE_BRACKET.search(line)
-        if m and "найден" not in l:
-            res.append(ROMAN[m.group(1)])
-            continue
-
-        if "{" in line:
-            if "сфер" in l:
-                spheres += 1
-            elif "заметк" in l:
-                notes += 1
-            elif "знак" in l:
-                signs += 1
-            else:
-                t = RE_TRAIL.search(line)
-                if t:
-                    res.append(ROMAN[t.group(1)])
-
-    bonus_res = bonus_sph = 0
-    if dup_line is not None:
-        if "сфер" in dup_line:
-            target = "s"
-        elif "ресурс" in dup_line:
-            target = "r"
-        else:
-            target = "s" if spheres else "r"
-        if target == "s":
-            bonus_sph = spheres
-        else:
-            bonus_res = len(res)
-
-    grades = [0, 0, 0]
-    for g in res:
-        grades[g] += 1
-    if bonus_res:
-        for g in res:
-            grades[g] += 1
-
-    return {
-        "mode": mode,
-        "g": grades,
-        "bg": bonus_res,
-        "s": spheres + bonus_sph,
-        "bs": bonus_sph,
-        "n": notes,
-        "z": signs,
-        "ok": bool(res or spheres or notes or signs),
+    params = {
+        'peer_id': peer_id,
+        'message': message,
+        'random_id': random.randint(1, 2147483647)
     }
+    if payload:
+        params['payload'] = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
 
-
-def make_key(user_id, fdate, ftext):
-    raw = f"{user_id}|{fdate}|{ftext}".encode("utf-8")
-    return hashlib.md5(raw).hexdigest()[:16]
-
-
-def add_stat_records(peer_id, recs):
-    """Добавляет записи в статистику чата. Возвращает (список добавленных записей, число дубликатов)."""
-    added = []
-    dupes = 0
-    key = str(peer_id)
-    with stats_lock:
-        bucket = stats.setdefault(key, [])
-        seen = stats_seen.setdefault(key, set())
-        for rec in recs:
-            if rec["k"] in seen:
-                dupes += 1
-                continue
-            seen.add(rec["k"])
-            bucket.append(rec)
-            added.append(rec)
-        if added:
-            save_stats()
-    return added, dupes
-
-
-def fmt_recorded(name, recs):
-    """Короткая пометка о записанных сборах (без подробностей)."""
-    return "✅ Ресурсы записаны"
-
-
-def aggregate(recs):
-    out = {}
-    for mode in ("v", "r"):
-        out[mode] = {"c": 0, "g": [0, 0, 0], "bg": 0, "s": 0, "bs": 0, "n": 0, "z": 0}
-    for r in recs:
-        a = out.get(r.get("m"))
-        if a is None:
-            continue
-        a["c"] += 1
-        for i in range(3):
-            a["g"][i] += r["g"][i]
-        a["bg"] += r.get("bg", 0)
-        a["s"] += r.get("s", 0)
-        a["bs"] += r.get("bs", 0)
-        a["n"] += r.get("n", 0)
-        a["z"] += r.get("z", 0)
-    return out
-
-
-def fmt_pct(part, total):
-    pct = (part / total * 100) if total else 0
-    return f"{pct:.1f}".replace(".", ",") + "%"
-
-
-def format_stats(recs, scope_title, period_title):
-    """Одна общая сводка. Строки короткие, чтобы не переносились в узком пузыре сообщения."""
-    agg = aggregate(recs)
-    v, r = agg["v"], agg["r"]
-    c = v["c"] + r["c"]
-    g = [v["g"][i] + r["g"][i] for i in range(3)]
-    bonus = v["bg"] + r["bg"] + v["bs"] + r["bs"]
-    sph = v["s"] + r["s"]
-    notes = v["n"] + r["n"]
-    signs = v["z"] + r["z"]
-    total_res = sum(g)
-
-    # Первая строка длинная и без эмодзи: VK тянет пузырь по самой длинной строке,
-    # а строки с эмодзи считает уже, чем рисует, и переносит их.
-    lines = [f"Стата · {scope_title} · {period_title}", ""]
-    if c == 0:
-        lines.append("Сборов пока нет.")
-        return "\n".join(lines)
-
-    lines += [f"🔢 Сборов: {c}", f"{PICK} Ресурсов: {total_res}", ""]
-    for emoji, i in (("⚪", 0), ("🔵", 1), ("🟣", 2)):
-        lines.append(f"{emoji} {g[i]} — {fmt_pct(g[i], total_res)}")
-    lines += ["", f"📦 Сферы: {sph}", f"📜 Заметки: {notes}", f"🎖 Знаки: {signs}"]
-    if bonus:
-        lines.append(f"🎁 Бонусных: {bonus}")
-    return "\n".join(lines)
-
-
-# ==========================================
-# 📈 КОМАНДА /стата
-# ==========================================
-STATS_HEADS = ("/стата", "/стат", "/stats")
-PERIOD_WORDS = {
-    "сегодня": "today", "сег": "today", "today": "today",
-    "вчера": "yesterday",
-    "неделя": "week", "неделю": "week", "нед": "week", "week": "week",
-    "месяц": "month", "мес": "month", "month": "month",
-    "всё": "all", "все": "all", "всегда": "all", "all": "all",
-}
-SCOPE_WORDS = {"общая", "общую", "общий", "общее", "всех"}
-EXTRA_WORDS = {"время", "сброс"}
-STATS_USAGE = (
-    "ℹ️ Формат: /стата [общая] [сегодня | вчера | неделя | месяц | всё]\n"
-    "Примеры: /стата, /стата неделя, /стата общая месяц"
-)
-
-
-def parse_stats_command(clean_text):
-    tokens = clean_text.split()
-    if not tokens or tokens[0] not in STATS_HEADS:
-        return None
-    args = tokens[1:]
-
-    cmd = {"scope": "me", "period": "today", "reset": False, "error": False}
-    for a in args:
-        if a in SCOPE_WORDS:
-            cmd["scope"] = "all"
-        elif a in PERIOD_WORDS:
-            cmd["period"] = PERIOD_WORDS[a]
-        elif a == "сброс":
-            cmd["reset"] = True
-        elif a == "время":
-            continue
-        else:
-            cmd["error"] = True
-    return cmd
-
-
-def handle_stats_command(peer_id, user_id, clean_text):
-    cmd = parse_stats_command(clean_text)
-    if cmd is None:
-        return False
-
-    if cmd["error"]:
-        send_msg(peer_id, STATS_USAGE)
+    data = vk_api_request("messages.send", params)
+    if data and 'response' in data:
+        print("✅ Сообщение успешно доставлено!")
         return True
-
-    if cmd["reset"]:
-        if user_id != ADMIN_ID:
-            send_msg(peer_id, "⛔ У вас нет доступа к этой команде.")
-            return True
-        with stats_lock:
-            stats[str(peer_id)] = []
-            stats_seen[str(peer_id)] = set()
-            save_stats()
-        send_msg(peer_id, "🗑 Статистика этого чата очищена.")
-        return True
-
-    start, end, period_title = period_range(cmd["period"], time.time())
-    with stats_lock:
-        recs = list(stats.get(str(peer_id), []))
-    recs = [
-        r for r in recs
-        if r["t"] >= start and (end is None or r["t"] < end)
-        and (cmd["scope"] == "all" or r["u"] == user_id)
-    ]
-    scope_title = "Общая" if cmd["scope"] == "all" else "Моя"
-    send_msg(peer_id, format_stats(recs, scope_title, period_title))
-    return True
-
-
-# ==========================================
-# 🏆 КОМАНДА /топ
-# ==========================================
-_full_cache = {}
-
-
-def get_full_name(user_id):
-    if user_id in _full_cache:
-        return _full_cache[user_id]
-    name = f"id{user_id}"
-    try:
-        with api_lock:
-            res = vk.users.get(user_ids=user_id)
-        if res:
-            first = (res[0].get("first_name") or "").strip()
-            last = (res[0].get("last_name") or "").strip()
-            name = (first + " " + last).strip() or name
-    except Exception as e:
-        print(f"⚠️ Не удалось получить имя {user_id}: {e}")
-        return name
-    _full_cache[user_id] = name
-    return name
-
-
-PICK = "\u26cf\ufe0f"  # ⛏️ значок ресурсов
-TOP_USAGE = (
-    "ℹ️ Топ игроков по ресурсам:\n"
-    "/топ — за неделю\n"
-    "/топ месяц — за месяц\n"
-    "/топ всё — за всё время\n"
-    "Ещё: сегодня, вчера"
-)
-TOP_FILLER = {"за", "время"}
-TOP_PERIOD_TITLES = {
-    "today": "Сегодня",
-    "yesterday": "Вчера",
-    "week": "Неделя",
-    "month": "Месяц",
-    "all": "Всё время",
-}
-RU_MONTHS = [
-    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
-]
-RU_MONTHS_GEN = [
-    "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
-]
-
-
-NAME_FIT = 18  # столько символов помещается в строку узкого пузыря сообщения
-
-
-def short_name(full):
-    """Имя и фамилия целиком, если помещаются в строку. Длинные сокращаем: 'Анастасия Вербицкая' -> 'Анастасия В.'."""
-    full = " ".join(full.split())
-    if len(full) <= NAME_FIT:
-        return full
-    parts = full.split()
-    if len(parts) > 1 and not full.startswith("id"):
-        return f"{parts[0][:12]} {parts[1][0]}."
-    return full[:NAME_FIT]
-
-
-def top_rows(peer_id, start, end, limit=10):
-    """Топ игроков чата за период: [(имя, всего ресурсов, фиолетовых)].
-    Сортировка по общему числу ресурсов, при равенстве по фиолетовым."""
-    with stats_lock:
-        recs = list(stats.get(str(peer_id), []))
-    agg = {}
-    for r in recs:
-        if r["t"] < start or (end is not None and r["t"] >= end):
-            continue
-        a = agg.setdefault(r["u"], [0, 0])
-        a[0] += sum(r["g"])
-        a[1] += r["g"][2]
-    rows = [(u, tot, vio) for u, (tot, vio) in agg.items() if tot > 0]
-    rows.sort(key=lambda x: (-x[1], -x[2], x[0]))
-    return [(short_name(get_full_name(u)), tot, vio) for u, tot, vio in rows[:limit]]
-
-
-def format_top(rows, head):
-    """Две строки на игрока, имя на всю ширину пузыря, медаль во второй строке:
-    Иван Иванов
-    🥇 ⛏️ 200 · 🟣 20"""
-    lines = [head, ""]
-    if not rows:
-        lines.append("Пока нет ресурсов.")
-        return "\n".join(lines)
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (name, tot, vio) in enumerate(rows):
-        mark = medals[i] if i < 3 else f"{i + 1}."
-        lines.append(name)
-        lines.append(f"{mark} {PICK} {tot} · 🟣 {vio}")
-    return "\n".join(lines)
-
-
-def handle_top_command(peer_id, user_id, clean_text):
-    tokens = clean_text.split()
-    if not tokens or tokens[0] not in ("/топ", "/top"):
-        return False
-    args = [a for a in tokens[1:] if a not in TOP_FILLER]
-
-    period = "week"
-    for a in args:
-        if a in PERIOD_WORDS:
-            period = PERIOD_WORDS[a]
-        else:
-            send_msg(peer_id, TOP_USAGE)
-            return True
-
-    start, end, _ = period_range(period, time.time())
-    rows = top_rows(peer_id, start, end)
-    send_msg(peer_id, format_top(rows, f"Топ игроков · {TOP_PERIOD_TITLES[period]}"))
-    return True
-
-
-def week_range_title(monday):
-    sunday = monday + timedelta(days=6)
-    if monday.month == sunday.month:
-        return f"{monday.day}–{sunday.day} {RU_MONTHS_GEN[sunday.month - 1]}"
-    return (
-        f"{monday.day} {RU_MONTHS_GEN[monday.month - 1]} – "
-        f"{sunday.day} {RU_MONTHS_GEN[sunday.month - 1]}"
-    )
-
-
-def send_period_top(start, end, head, footer):
-    """Шлёт итоги периода в чаты, где за него были сборы. True, если отправлено или слать некуда."""
-    sent_any = failed = False
-    for pid in TOP_PEER_IDS:
-        rows = top_rows(pid, start, end)
-        if not rows:
-            continue
-        if send_msg(pid, format_top(rows, head) + "\n\n" + footer):
-            sent_any = True
-        else:
-            failed = True
-    return sent_any or not failed
-
-
-def post_period_tops(now=None):
-    """С воскресенья на понедельник присылает итоги недели, 1-го числа итоги месяца (по Москве).
-    Какой период уже отправлен, помнит в файле, поэтому перезапуск не даёт дублей.
-    При самом первом запуске ничего задним числом не шлёт."""
-    now = time.time() if now is None else now
-    today = datetime.fromtimestamp(now, MSK).replace(hour=0, minute=0, second=0, microsecond=0)
-    this_monday = today - timedelta(days=today.weekday())
-    prev_monday = this_monday - timedelta(days=7)
-    this_month = today.replace(day=1)
-    prev_month = (this_month - timedelta(days=1)).replace(day=1)
-
-    jobs = [
-        (
-            "week",
-            prev_monday.date().isoformat(),
-            prev_monday.timestamp(),
-            this_monday.timestamp(),
-            f"Топ недели · {week_range_title(prev_monday)}",
-            "🔄 Новая неделя — счётчик с нуля.",
-        ),
-        (
-            "month",
-            prev_month.strftime("%Y-%m"),
-            prev_month.timestamp(),
-            this_month.timestamp(),
-            f"Топ месяца · {RU_MONTHS[prev_month.month - 1]}",
-            "🔄 Новый месяц — счётчик с нуля.",
-        ),
-    ]
-    for kind, key, start, end, head, footer in jobs:
-        with stats_lock:
-            last = posted.get(kind)
-            if last is None:
-                posted[kind] = key
-                save_stats()
-                continue
-            if last == key:
-                continue
-        st = _post_state.get(kind)
-        if st and now < st["next"]:
-            continue
-
-        if send_period_top(start, end, head, footer):
-            with stats_lock:
-                posted[kind] = key
-                save_stats()
-            _post_state.pop(kind, None)
-        else:
-            tries = (st["tries"] if st else 0) + 1
-            if tries >= 5:
-                with stats_lock:
-                    posted[kind] = key
-                    save_stats()
-                _post_state.pop(kind, None)
-            else:
-                _post_state[kind] = {"tries": tries, "next": now + 60}
-
-
-# ==========================================
-# 📖 КОМАНДА /помощь
-# ==========================================
-HELP_USER = (
-    "📖 Команды\n"
-    "\n"
-    "Просто пересылайте сюда сообщения от Атраксиса: бот сам запишет ресурсы, "
-    "поставит таймер на босса и исследование и удалит ваше сообщение. "
-    "Если приписать к пересланному подпись, сообщение останется.\n\n"
-    "📊 /стата [общая] [сегодня | вчера | неделя | месяц | всё] — статистика сборов\n"
-    "🏆 /топ — топ по ресурсам за неделю, /топ месяц, /топ всё (за всё время)\n"
-    "⏳ /таймеры — ваши активные таймеры\n"
-    "⏰ /таймер 45м кузница — свой таймер (45м, 1ч30м, 90)\n"
-    "🗑 /отмена [босс | исследование | свои] — отменить таймеры\n"
-    "📜 /статус — сколько рун собрано\n"
-    "🏓 /пинг — проверить, что бот жив"
-)
-
-HELP_ADMIN = (
-    "🛠 Админ-команды\n"
-    "\n"
-    "💾 /код — все собранные коды рун\n"
-    "➕ /add <аспект> <код> — внести руну вручную\n"
-    "➖ /удалить <аспект> — удалить одну руну\n"
-    "🗑 /очистить — очистить базу рун\n"
-    "📢 /все <текст> — рассылка во все рабочие чаты\n"
-    "🧹 /стата сброс — очистить статистику этого чата\n"
-    "🔎 /кто — перешлите сообщение с этой командой, бот покажет его from_id\n"
-    "🆔 /id — ID этого чата"
-)
-
-
-def handle_help_command(peer_id, user_id, clean_text):
-    tokens = clean_text.split()
-    if not tokens:
-        return False
-    head = tokens[0]
-    if head in ("/админ", "/адм"):
-        admin = True
-    elif head in ("/помощь", "/help", "/команды", "/хелп"):
-        admin = len(tokens) > 1 and tokens[1].startswith("адм")
-    else:
-        return False
-
-    if admin and user_id != ADMIN_ID:
-        send_msg(peer_id, "⛔ У вас нет доступа к этой команде.")
-        return True
-    send_msg(peer_id, HELP_ADMIN if admin else HELP_USER)
-    return True
-
-
-# ==========================================
-# ⏳ ТАЙМЕРЫ (БОСС / ИССЛЕДОВАНИЕ)
-# ==========================================
-def timer_kind(text):
-    low = text.lower()
-    if "урон по боссу" in low:
-        return "boss"
-    if "следующее исследование" in low:
-        return "research"
-    return None
-
-
-def set_timer(peer_id, user_id, kind, start, name):
-    """Ставит таймер. Возвращает (статус, время срабатывания).
-    Статусы: new, dupe (такое сообщение уже учтено), expired (час уже прошёл)."""
-    now = time.time()
-    due = start + TIMER_SECONDS
-    with timers_lock:
-        existing = None
-        for t in timers:
-            if t["peer"] == peer_id and t["user"] == user_id and t["kind"] == kind:
-                existing = t
-                break
-        if existing and start <= existing["start"]:
-            return "dupe", existing["due"]
-        if existing:
-            timers.remove(existing)
-        if due <= now:
-            save_timers()
-            return "expired", due
-        timers.append({
-            "peer": peer_id,
-            "user": user_id,
-            "kind": kind,
-            "start": start,
-            "due": due,
-            "name": name,
-        })
-        save_timers()
-    return "new", due
-
-
-RE_DUR = re.compile(r"(\d+)\s*([чмсhms])[а-яёa-z]*")
-UNIT_WORD = re.compile(r"^(ч|час\w*|м|мин\w*|сек\w*|h|hr|hour\w*|m|min\w*|sec\w*)$")
-TIMER_USAGE = (
-    "ℹ️ Формат: /таймер <время> [подпись]\n"
-    "Время: 45м, 1ч30м, 2ч, 90 (минуты), 1:30\n"
-    "Пример: /таймер 45м кузница"
-)
-
-
-def fmt_dur(seconds):
-    seconds = int(seconds)
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    parts = []
-    if h:
-        parts.append(f"{h}ч")
-    if m:
-        parts.append(f"{m}м")
-    if s and not h:
-        parts.append(f"{s}с")
-    return " ".join(parts) or "0с"
-
-
-def parse_duration_token(tok):
-    """'45м', '1ч30м', '90' (минуты), '1:30' -> секунды, иначе None."""
-    tok = tok.strip().lower()
-    if not tok:
-        return None
-    if tok.isdigit():
-        return int(tok) * 60
-    m = re.fullmatch(r"(\d+):(\d{2})", tok)
-    if m:
-        return int(m.group(1)) * 3600 + int(m.group(2)) * 60
-    pos = total = 0
-    found = False
-    for m in RE_DUR.finditer(tok):
-        if m.start() != pos:
-            return None
-        n, u = int(m.group(1)), m.group(2)
-        total += n * (3600 if u in "чh" else 60 if u in "мm" else 1)
-        pos = m.end()
-        found = True
-    return total if found and pos == len(tok) else None
-
-
-def merge_duration_args(args):
-    """'5 минут' -> '5минут', '1ч 30 мин' -> '1ч', '30мин'. Одиночное «с» секундой не считается."""
-    out = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a.isdigit() and i + 1 < len(args) and UNIT_WORD.match(args[i + 1].lower()):
-            out.append(a + args[i + 1])
-            i += 2
-        else:
-            out.append(a)
-            i += 1
-    return out
-
-
-def timer_title(t):
-    if t["kind"] == "custom":
-        return f"⏰ {t.get('label') or 'Таймер'}"
-    info = KINDS[t["kind"]]
-    return f"{info['icon']} {info['title']}"
-
-
-def handle_custom_timer(peer_id, user_id, text):
-    args = merge_duration_args(text.split()[1:])
-    total = None
-    i = 0
-    while i < len(args):
-        tok = args[i].lower()
-        if i > 0 and (tok.isdigit() or ":" in tok):
-            break
-        sec = parse_duration_token(tok)
-        if sec is None:
-            break
-        total = (total or 0) + sec
-        i += 1
-
-    if total is None:
-        send_msg(peer_id, TIMER_USAGE)
-        return True
-    if total < CUSTOM_MIN:
-        send_msg(peer_id, f"⚠️ Минимальное время таймера — {CUSTOM_MIN} секунд.")
-        return True
-    if total > CUSTOM_MAX:
-        send_msg(peer_id, "⚠️ Максимальное время таймера — 24 часа.")
-        return True
-
-    label = " ".join(args[i:]).strip()[:60]
-    now = time.time()
-    name = get_name(user_id)
-    with timers_lock:
-        mine = [
-            t for t in timers
-            if t["peer"] == peer_id and t["user"] == user_id and t["kind"] == "custom"
-        ]
-        if len(mine) >= CUSTOM_LIMIT:
-            full = True
-        else:
-            full = False
-            timers.append({
-                "peer": peer_id,
-                "user": user_id,
-                "kind": "custom",
-                "start": now,
-                "due": now + total,
-                "name": name,
-                "label": label,
-            })
-            save_timers()
-    if full:
-        mid = send_msg(
-            peer_id,
-            f"⚠️ {name}, у вас уже {CUSTOM_LIMIT} своих таймеров. Освободите место: /отмена свои",
-        )
-        schedule_delete(mid, WARNING_TTL)
-        return True
-
-    what = f" «{label}»" if label else ""
-    mid = send_msg(
-        peer_id,
-        f"⏰ {name}, таймер{what} на {fmt_dur(total)}. Напомню в {hhmm(now + total)}.",
-    )
-    schedule_delete(mid, NOTICE_TTL)
-    return True
-
-
-def handle_timer_commands(peer_id, user_id, clean_text, text=None):
-    tokens = clean_text.split()
-    if not tokens:
-        return False
-    head = tokens[0]
-    text = text if text is not None else clean_text
-
-    if head in ("/таймеры", "/timers"):
-        now = time.time()
-        with timers_lock:
-            mine = [t for t in timers if t["peer"] == peer_id and t["user"] == user_id]
-        if not mine:
-            send_msg(peer_id, "⏳ У вас нет активных таймеров.")
-            return True
-        lines = ["Ваши активные таймеры:"]
-        for t in sorted(mine, key=lambda x: x["due"]):
-            lines.append(
-                f"{timer_title(t)} · {hhmm(t['due'])} "
-                f"({fmt_left(t['due'] - now)})"
-            )
-        send_msg(peer_id, "\n".join(lines))
-        return True
-
-    if head in ("/таймер", "/timer"):
-        return handle_custom_timer(peer_id, user_id, text)
-
-    if head in ("/отмена", "/cancel"):
-        want = None
-        if len(tokens) > 1:
-            if tokens[1].startswith("бос"):
-                want = "boss"
-            elif tokens[1].startswith("исслед"):
-                want = "research"
-            elif tokens[1].startswith(("сво", "мои", "тайм")):
-                want = "custom"
-        with timers_lock:
-            before = len(timers)
-            timers[:] = [
-                t for t in timers
-                if not (
-                    t["peer"] == peer_id and t["user"] == user_id
-                    and (want is None or t["kind"] == want)
-                )
-            ]
-            removed = before - len(timers)
-            if removed:
-                save_timers()
-        send_msg(peer_id, f"🗑 Отменено таймеров: {removed}")
-        return True
-
+    print(f"❌ Ошибка отправки: {data}")
     return False
 
 
-def scheduler_tick(now=None):
-    """Один проход планировщика: срабатывают таймеры и удаляются старые сообщения бота."""
-    now = time.time() if now is None else now
+def get_history(peer_id, count=5):
+    data = vk_api_request("messages.getHistory", {'peer_id': peer_id, 'count': count})
+    if data and 'response' in data:
+        return data['response'].get('items', [])
+    return []
 
-    due = []
-    with timers_lock:
-        keep = []
-        for t in timers:
-            (due if t["due"] <= now else keep).append(t)
-        if due:
-            timers[:] = keep
-            save_timers()
 
-    for t in due:
-        if now - t["due"] > TIMER_STALE:
-            continue
-        who = f"[id{t['user']}|{t.get('name') or 'игрок'}]"
-        if t["kind"] == "custom":
-            label = t.get("label") or ""
-            text = f"⏰ {who}, время вышло" + (f": {label}!" if label else "!")
-        else:
-            info = KINDS.get(t["kind"])
-            if info is None:
+def get_last_msg_id(peer_id):
+    items = get_history(peer_id, 1)
+    return items[0].get('id', 0) if items else 0
+
+
+# ============================== КНОПКА ПОДТВЕРЖДЕНИЯ ==============================
+def find_confirm_button(msg):
+    """Ищет в сообщении кнопку «Подтвердить». Возвращает action кнопки или None."""
+    kb = msg.get('keyboard') or msg.get('inline_keyboard')
+    if not kb:
+        return None
+    for row in kb.get('buttons', []):
+        for btn in (row if isinstance(row, list) else [row]):
+            action = btn.get('action', {})
+            label = (action.get('label') or '').lower()
+            payload = str(action.get('payload', '')).lower()
+            if 'отмен' in label or 'cancel' in payload:
                 continue
-            text = f"{who}, {info['remind']}"
-        mid = send_msg(t["peer"], text)
-        if mid:
-            schedule_delete(mid, REMINDER_TTL, now)
-        elif t.get("tries", 0) < 3:
-            t["tries"] = t.get("tries", 0) + 1
-            t["due"] = now + 15
-            with timers_lock:
-                timers.append(t)
-                save_timers()
-
-    ready = []
-    with timers_lock:
-        keep = []
-        for d in deletions:
-            (ready if d["at"] <= now else keep).append(d)
-        if ready:
-            deletions[:] = keep
-            save_timers()
-    for d in ready:
-        delete_msg(d["mid"])
-
-    try:
-        post_period_tops(now)
-    except Exception:
-        print("⚠️ Ошибка публикации итогов:")
-        traceback.print_exc()
+            if 'подтверд' in label or 'confirm' in payload:
+                return action
+    return None
 
 
-def scheduler_loop():
-    while True:
-        try:
-            scheduler_tick()
-        except Exception:
-            print("⚠️ Ошибка планировщика:")
-            traceback.print_exc()
+CALLBACK_METHODS = ["messages.sendMessageEvent", "messages.getCallbackAnswer"]
+
+
+def press_message_button(peer_id, action):
+    """Лавка №4 (Arcana Market): как и раньше — отправляем сообщение с payload кнопки."""
+    label = action.get('label') or "Подтвердить"
+    print(f"🎯 [message] Нажимаем кнопку «{label}»")
+    return send_message(peer_id, label, action.get('payload'))
+
+
+def press_callback_button(peer_id, msg, action):
+    """
+    Лавка №1 (Dark Requiem): callback-кнопка. В чат ничего не отправляется —
+    нажатие идёт отдельным запросом к API, как в приложении ВК.
+    """
+    payload = action.get('payload')
+    print(f"🎯 [callback] Нажимаем «{action.get('label')}» в сообщении id={msg.get('id')}, "
+          f"cmid={msg.get('conversation_message_id')}, payload={payload}")
+    for method in CALLBACK_METHODS:
+        resp = vk_api_request(method, {
+            'peer_id': peer_id,
+            'message_id': msg.get('id'),
+            'conversation_message_id': msg.get('conversation_message_id'),
+            'payload': payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False),
+        })
+        print(f"   ↳ {method}: {resp}")
+        if resp and 'error' not in resp:
+            return True
+    print("❌ Не удалось нажать callback-кнопку ни одним методом.")
+    return False
+
+
+def press_button(store, msg, action):
+    mode = store.get('confirm_mode')
+    if mode == 'callback':
+        return press_callback_button(store['peer_id'], msg, action)
+    if mode == 'message':
+        return press_message_button(store['peer_id'], action)
+    return False
+
+
+def wait_for_result(store, after_id):
+    """
+    Ждёт ответ лавки на команду покупки. Если приходит сообщение с кнопкой
+    «Подтвердить» — нажимает её (только на НОВЫХ сообщениях, старые игнорируются).
+    Возвращает текст финального ответа лавки (или пустую строку по таймауту).
+    """
+    peer_id = store['peer_id']
+    pressed_ids = set()
+    presses = 0
+    deadline = time.time() + CONFIRM_WAIT
+    result_text = ""
+
+    while time.time() < deadline:
         time.sleep(2)
+        msgs = [m for m in get_history(peer_id, 6)
+                if m.get('id', 0) > after_id and not m.get('out')]
+        msgs.sort(key=lambda m: m['id'])
 
-
-# ==========================================
-# 📦 ОБРАБОТКА ПЕРЕСЛАННЫХ СООБЩЕНИЙ ИГРЫ (СБОРЫ И ТАЙМЕРЫ)
-# ==========================================
-def process_game_forwards(msg, peer_id, user_id, fwd_messages):
-    """Обрабатывает пачку пересланных сообщений Атраксиса: сборы и таймеры.
-    Возвращает True, если в сообщении было что-то распознано."""
-    now = time.time()
-    new_recs = []
-    timer_events = []
-    unparsed = 0
-    recognized = False
-
-    for fwd in fwd_messages:
-        if fwd.get("from_id") != ATRAXIS_ID:
-            continue
-        ftext = fwd.get("text") or ""
-        fdate = int(fwd.get("date") or now)
-
-        g = parse_gather(ftext)
-        if g is not None:
-            recognized = True
-            if not g["ok"]:
-                unparsed += 1
+        # 1) есть новая кнопка подтверждения — жмём (самую свежую)
+        pressed_now = False
+        for m in reversed(msgs):
+            if m['id'] in pressed_ids:
                 continue
-            new_recs.append({
-                "k": make_key(user_id, fdate, ftext),
-                "u": user_id,
-                "t": fdate,
-                "m": g["mode"],
-                "g": g["g"],
-                "bg": g["bg"],
-                "s": g["s"],
-                "bs": g["bs"],
-                "n": g["n"],
-                "z": g["z"],
-            })
+            action = find_confirm_button(m) if store.get('confirm_mode') else None
+            if action:
+                if presses >= CONFIRM_MAX_PRESSES:
+                    print("⚠️ Достигнут лимит нажатий подтверждения.")
+                    return result_text
+                if not press_button(store, m, action):
+                    return result_text
+                pressed_ids.add(m['id'])
+                presses += 1
+                deadline = time.time() + CONFIRM_WAIT   # даём время на ответ после нажатия
+                pressed_now = True
+                break
+        if pressed_now:
             continue
 
-        kind = timer_kind(ftext)
-        if kind:
-            recognized = True
-            timer_events.append((kind, fdate))
-            continue
+        # 2) кнопок нет — смотрим, пришёл ли итоговый ответ
+        final_msgs = [m.get('text', '') for m in msgs
+                      if not (store.get('confirm_mode') and find_confirm_button(m))
+                      and m['id'] not in pressed_ids]
+        text = "\n".join(final_msgs)
+        if text:
+            result_text = text
+            if any(k in text.lower() for k in FINAL_MARKERS):
+                return text
 
-        if is_gather_start(ftext):
-            recognized = True  # сообщение о начале сбора просто удаляем
+    return result_text
 
-    if not recognized:
+
+# ============================== СТАТИСТИКА ==============================
+def get_weekly_stats_text():
+    if not purchase_history:
+        return "• Покупок пока зафиксировано не было."
+
+    now_dt = datetime.now()
+    start_of_week = (now_dt - timedelta(days=now_dt.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+    week, total = {}, {}
+    for item in purchase_history:
+        key = f"{item['store']} ➔ {item.get('matrix', 'Грави-всплеск')}"
+        total[key] = total.get(key, 0) + item['amount']
+        if item['time'] >= start_of_week:
+            week[key] = week.get(key, 0) + item['amount']
+
+    lines = ["📅 **Статистика за текущую неделю:**"]
+    if week:
+        for key, amount in week.items():
+            lines.append(f"  ▪️ «{key}» — **{amount}** шт.")
+        lines.append(f"📦 **Итого за неделю:** {sum(week.values())} шт.")
+    else:
+        lines.append("  ▪️ На этой неделе покупок ещё не было.")
+
+    lines.append("\n🏆 **Статистика за всё время:**")
+    for key, amount in total.items():
+        lines.append(f"  ▪️ «{key}» — **{amount}** шт.")
+    lines.append(f"📦 **Итого за всё время:** {sum(total.values())} шт.")
+    return "\n".join(lines)
+
+
+def record_purchase(amount, store_name, matrix_name):
+    purchase_history.append({
+        'time': time.time(), 'amount': amount,
+        'store': store_name, 'matrix': matrix_name
+    })
+    save_json(HISTORY_FILE, purchase_history)
+
+
+# ============================== КОМАНДЫ ИЗ ИЗБРАННОГО ==============================
+HELP_TEXT = (
+    "🤖 **Панель управления ботом**\n\n"
+    "🎯 **Управление матрицами:**\n"
+    "• `/добавить Название` — искать во всех лавках\n"
+    "• `/добавить Панцирь, Ускользание 2 3` — искать в лавках №2 и №3\n"
+    "• `/удалить Панцирь` — убрать матрицу\n"
+    "• `/матрицы` — список отслеживаемых позиций\n"
+    "• `/очистить матрицы` — удалить все цели\n\n"
+    "🏪 **Управление лавками:**\n"
+    "• `/лавки` — статус и список лавок\n"
+    "• `/off` — поставить авто-покупку на паузу\n"
+    "• `/on` — возобновить работу\n"
+    "• `/off 3` / `/on 3` — выключить/включить конкретную лавку\n\n"
+    "📊 **Информация:**\n"
+    "• `/статус` — общая сводка и отчёты\n"
+    "• `/сброс` — очистить историю покупок"
+)
+
+
+def check_commands(current_state):
+    global last_processed_msg_id, purchase_history, target_matrices
+
+    data = vk_api_request("messages.getHistory", {'user_id': MY_USER_ID, 'count': 1})
+    if not (data and 'response' in data):
+        return current_state
+    items = data['response'].get('items', [])
+    if not items:
+        return current_state
+
+    msg = items[0]
+    msg_id = msg.get('id', 0)
+    if msg_id <= last_processed_msg_id:
+        return current_state
+    last_processed_msg_id = msg_id
+
+    raw_text = msg.get('text', '').strip()
+    text = raw_text.lower()
+
+    if text in ['/хелп', '/help', '/команды']:
+        send_message(MY_USER_ID, HELP_TEXT)
+        return current_state
+
+    # --- /добавить ---
+    if text.startswith('/добавить'):
+        payload = raw_text[9:].strip()
+        if not payload:
+            send_message(MY_USER_ID, "⚠️ **Ошибка:** Укажите название.\n\n*Пример:*\n`/добавить Ускользание`\n`/добавить Панцирь, Ускользание 2 3`")
+            return current_state
+
+        target_store_ids = [1, 2, 3, 4]
+        parts_space = payload.split()
+        trailing_ids = []
+        while len(parts_space) > 1 and parts_space[-1] in ['1', '2', '3', '4']:
+            trailing_ids.insert(0, int(parts_space.pop()))
+        if trailing_ids:
+            target_store_ids = trailing_ids
+            payload = " ".join(parts_space)
+
+        matrix_names = [p.strip() for p in payload.split(',') if p.strip()]
+        if not matrix_names:
+            send_message(MY_USER_ID, "⚠️ Не удалось распознать названия матриц.")
+            return current_state
+
+        added = []
+        for m_name in matrix_names:
+            existing = next((i for i in target_matrices if i['name'].lower() == m_name.lower()), None)
+            if existing:
+                existing['stores'] = target_store_ids
+            else:
+                target_matrices.append({'name': m_name, 'stores': target_store_ids})
+            added.append(f"• «{m_name}» ➔ Лавки: [{', '.join(map(str, target_store_ids))}]")
+
+        save_json(MATRICES_FILE, target_matrices)
+        send_message(MY_USER_ID, "✅ **Успешно добавлено в отслеживание:**\n" + "\n".join(added))
+        return current_state
+
+    # --- /удалить ---
+    if text.startswith('/удалить') or text.startswith('/снять'):
+        payload = raw_text.split(maxsplit=1)[1].strip() if len(raw_text.split()) > 1 else ""
+        if not payload:
+            send_message(MY_USER_ID, "⚠️ **Ошибка:** Укажите название.\n\n*Пример:* `/удалить Панцирь`")
+            return current_state
+
+        parts = [p.strip() for p in payload.split(',') if p.strip()]
+        target_store_id = None
+        if len(parts) > 1 and parts[-1] in ['1', '2', '3', '4']:
+            target_store_id = int(parts[-1])
+            m_names = [p.lower() for p in parts[:-1]]
+        else:
+            m_names = [p.lower() for p in parts]
+
+        removed_info, new_matrices = [], []
+        for item in target_matrices:
+            if item['name'].lower() not in m_names:
+                new_matrices.append(item)
+                continue
+            if target_store_id:
+                if target_store_id in item['stores']:
+                    item['stores'].remove(target_store_id)
+                    removed_info.append(f"• «{item['name']}» (отключена для Лавки №{target_store_id})")
+                if item['stores']:
+                    new_matrices.append(item)
+                else:
+                    removed_info.append(f"• «{item['name']}» (удалена полностью)")
+            else:
+                removed_info.append(f"• «{item['name']}» (удалена полностью)")
+
+        target_matrices = new_matrices
+        save_json(MATRICES_FILE, target_matrices)
+        if removed_info:
+            send_message(MY_USER_ID, "🗑️ **Изменения в отслеживании:**\n" + "\n".join(removed_info))
+        else:
+            send_message(MY_USER_ID, "⚠️ Указанные матрицы не найдены в вашем списке.")
+        return current_state
+
+    if text in ['/матрицы', '/список']:
+        if not target_matrices:
+            send_message(MY_USER_ID, "🛒 **Список матриц пуст.** Используйте `/добавить Название`.")
+        else:
+            lines = ["🛒 **Отслеживаемые матрицы:**\n"]
+            for i, m in enumerate(target_matrices, 1):
+                stores_str = ", ".join(f"№{s}" for s in m['stores'])
+                lines.append(f"  {i}. «**{m['name']}**» \n     └ Лавки: [{stores_str}]")
+            send_message(MY_USER_ID, "\n".join(lines))
+        return current_state
+
+    if text == '/очистить матрицы':
+        target_matrices = []
+        save_json(MATRICES_FILE, target_matrices)
+        send_message(MY_USER_ID, "🗑️ Список матриц полностью очищен.")
+        return current_state
+
+    m_off = re.match(r"^/off\s+(\d+)$", text)
+    m_on = re.match(r"^/on\s+(\d+)$", text)
+    if m_off:
+        idx = int(m_off.group(1)) - 1
+        if 0 <= idx < len(STORES):
+            STORES[idx]['disabled'] = True
+            send_message(MY_USER_ID, f"🔴 Лавка №{idx+1} («{STORES[idx]['name']}») временно отключена.")
+        return current_state
+    if m_on:
+        idx = int(m_on.group(1)) - 1
+        if 0 <= idx < len(STORES):
+            STORES[idx]['disabled'] = False
+            send_message(MY_USER_ID, f"🟢 Лавка №{idx+1} («{STORES[idx]['name']}») снова активна!")
+        return current_state
+
+    if text == '/off':
+        send_message(MY_USER_ID, "🔴 Авто-покупка поставлена на паузу.")
         return False
 
-    added, dupes = add_stat_records(peer_id, new_recs)
-    name = get_name(user_id)
+    if text in ['/on', '/включить']:
+        for store in STORES:
+            store['disabled'] = False
+        send_message(MY_USER_ID, "🟢 Авто-покупка успешно возобновлена!")
+        return True
 
-    notices = []   # короткие пометки без тега, исчезают через несколько секунд
-    tagged = []    # сообщения с тегом (должны прийти уведомлением и повисеть)
+    if text in ['/лавки', '/магазины']:
+        lines = ["🏪 **Состояние лавок:**\n"]
+        for i, s in enumerate(STORES, 1):
+            status = "🔴 Отключена" if s['disabled'] else "🟢 Активна"
+            lines.append(f"  {i}. «**{s['name']}**» — {status}")
+        send_message(MY_USER_ID, "\n".join(lines))
+        return current_state
 
-    if added:
-        text_ok = fmt_recorded(name, added)
-        if dupes:
-            text_ok += f"\n(уже было: {dupes})"
-        notices.append(text_ok)
-    elif dupes:
-        notices.append(f"ℹ️ {name}, это уже учтено ({dupes})")
-    if unparsed:
-        notices.append(f"⚠️ Не смог разобрать сообщений: {unparsed}. Они остались в чате.")
+    if text in ['/статус', '/status']:
+        state_str = "🟢 Активен" if current_state else "🔴 На паузе (/off)"
+        stores_status = [f"  • №{i} «{s['name']}»: {'🔴 Выкл' if s['disabled'] else '🟢 Вкл'}"
+                         for i, s in enumerate(STORES, 1)]
+        m_list = [m['name'] for m in target_matrices] or ["Список пуст"]
+        send_message(MY_USER_ID, (
+            f"📊 **Системный статус бота**\n\n"
+            f"⚙️ **Режим работы:** {state_str}\n"
+            f"🎯 **Цели поиска:** {', '.join(m_list)}\n"
+            f"🕒 **Последняя проверка:** {last_check_time}\n\n"
+            f"🏪 **Лавки:**\n" + "\n".join(stores_status) + "\n\n"
+            f"────────────────────────\n{get_weekly_stats_text()}"
+        ))
+        return current_state
 
-    for kind, fdate in timer_events:
-        info = KINDS[kind]
-        status, due = set_timer(peer_id, user_id, kind, fdate, name)
-        if status == "new":
-            notices.append(f"{info['icon']} {name}, {info['logged']}. Напомню в {hhmm(due)}.")
-        elif status == "dupe":
-            notices.append(f"ℹ️ {name}, этот таймер уже стоит (в {hhmm(due)}).")
-        else:
-            tagged.append(f"{info['icon']} [id{user_id}|{name}], час уже прошёл — {info['late']}!")
+    if text in ['/очистить', '/сброс', '/reset']:
+        purchase_history = []
+        save_json(HISTORY_FILE, purchase_history)
+        send_message(MY_USER_ID, "🗑️ История покупок успешно сброшена!")
+        return current_state
 
-    if notices:
-        mid = send_msg(peer_id, "\n\n".join(notices))
-        schedule_delete(mid, WARNING_TTL if unparsed else NOTICE_TTL)
-
-    for line in tagged:
-        mid = send_msg(peer_id, line)
-        schedule_delete(mid, REMINDER_TTL)
-
-    # Своё пересланное сообщение удаляем только если оно «голое»: без подписи и всё разобрано.
-    # Если игрок что-то приписал («круто!», хвастаемся), сообщение остаётся, но сбор всё равно записан.
-    has_caption = bool((msg.get("text") or "").strip())
-    if unparsed == 0 and not has_caption:
-        delete_msg(msg.get("id"))
-    return True
+    return current_state
 
 
-# ==========================================
-# 📨 ОБРАБОТКА ОДНОГО СООБЩЕНИЯ
-# ==========================================
-def handle_message(msg):
-    global last_reset_time
+# ============================== ПАРСЕРЫ КАТАЛОГОВ ==============================
+def parse_store_1(text, name):
+    m = re.search(f"{re.escape(name)}.*?{{\\d+\\s*\\|\\s*(\\d+)}}.*?\\[(\\d+)/\\d+\\]",
+                  text, re.DOTALL | re.IGNORECASE)
+    return (int(m.group(2)), int(m.group(1))) if m else (0, 0)
 
-    text = msg.get("text", "").strip()
-    user_id = msg.get("from_id")
-    peer_id = msg.get("peer_id")
 
-    if not user_id:
+def parse_store_2(text, name):
+    m = re.search(f"{re.escape(name)}[^\\n]*?/?\\s*(\\d+)\\s*·\\s*\\[(\\d+)/", text, re.IGNORECASE)
+    return (int(m.group(2)), int(m.group(1))) if m else (0, 0)
+
+
+def parse_store_3(text, name):
+    m = re.search(f"{re.escape(name)}.*?(?:\\((\\d+)/)?.*?\\[(\\d+)/\\d+\\]", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return (int(m.group(2)) if m.group(2) else 0), (int(m.group(1)) if m.group(1) else 0)
+    return 0, 0
+
+
+def parse_store_4(text, name):
+    m = re.search(f"{re.escape(name)}.*?🔮\\s*([\\d\\s]+).*?\\[(\\d+)/", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        price_str = m.group(1).replace(" ", "").replace("\xa0", "")
+        return int(m.group(2)), (int(price_str) if price_str.isdigit() else 0)
+    return 0, 0
+
+
+PARSERS = {1: parse_store_1, 2: parse_store_2, 3: parse_store_3, 4: parse_store_4}
+
+
+def parse_price_and_qty(text, store_id, matrix_name):
+    parser = PARSERS.get(store_id)
+    return parser(text, matrix_name) if parser else (0, 0)
+
+
+def build_purchase_command(items):
+    parts = [f"{i['name']} {i['qty']}" if i['qty'] > 1 else i['name'] for i in items]
+    return "Купить " + ", ".join(parts)
+
+
+def to_int(s):
+    s = (s or "").replace(" ", "").replace("\xa0", "")
+    return int(s) if s.isdigit() else None
+
+
+# ============================== ПРОВЕРКА ЛАВКИ ==============================
+def check_store(store):
+    if store['disabled']:
+        print(f"⏩ Пропускаем «{store['name']}» — лавка отключена.")
         return
 
-    fwd_messages = list(msg.get("fwd_messages", []))
-    if "reply_message" in msg:
-        fwd_messages.append(msg["reply_message"])
-
-    clean_text = text.lower()
-
-    # ----------------------------------------------------
-    # 1. ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ В БЕСЕДАХ
-    # ----------------------------------------------------
-    if clean_text in ["/id", "/чат", "/chat"]:
-        send_msg(peer_id, f"🆔 **ID этого чата:** `{peer_id}`")
+    active = [m for m in target_matrices if store['id'] in m['stores']]
+    if not active:
+        print(f"⏩ Для лавки «{store['name']}» нет активных матриц в списке.")
         return
 
-    if clean_text in [
-        "/статус",
-        "/прогресс",
-        "/руны",
-        "📊 статус рун",
-        "статус рун",
-    ]:
-        with data_lock:
-            status_msg = get_status_text(runes)
-        send_msg(peer_id, status_msg)
+    print("\n----------------------------------------")
+    print(f"📦 Проверяем магазин «{store['name']}»...")
+
+    if store['catalog_type'] == 'payload':
+        send_message(store['peer_id'], store['my_label'], store['my_payload'])
+    else:
+        send_message(store['peer_id'], store['catalog_cmd'])
+
+    time.sleep(random.randint(14, 19))
+
+    catalog_text = ""
+    for item in get_history(store['peer_id'], 3):
+        text = item.get('text', '')
+        if any(m['name'].lower() in text.lower() for m in active):
+            catalog_text = text
+            break
+
+    if not catalog_text:
+        print(f"⏳ Ответ от «{store['name']}» получен, но искомые матрицы не найдены.")
         return
 
-    if clean_text in ["/пинг", "/ping"]:
-        uptime_sec = int(time.time() - START_TIME)
-        hours, remainder = divmod(uptime_sec, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        uptime_str = f"{hours}ч {minutes}м {seconds}с"
+    current_items = []
+    for mat in active:
+        qty, price = parse_price_and_qty(catalog_text, store['id'], mat['name'])
+        if qty > 0:
+            current_items.append({'name': mat['name'], 'qty': qty, 'price': price})
 
-        send_msg(
-            peer_id,
-            f"🏓 **ПОНГ!** Юзербот работает стабильно.\n⏱ **Время онлайн:** {uptime_str}",
-        )
+    if not current_items:
+        print(f"⏳ В «{store['name']}» нет доступных матриц (0 шт.).")
         return
 
-    # Помощь, статистика, топ и таймеры работают только в рабочих чатах
-    if peer_id in RUNES_PEER_IDS:
-        if handle_help_command(peer_id, user_id, clean_text):
-            return
-        if handle_stats_command(peer_id, user_id, clean_text):
-            return
-        if handle_top_command(peer_id, user_id, clean_text):
-            return
-        if handle_timer_commands(peer_id, user_id, clean_text, text):
+    for _ in range(MAX_BUY_ATTEMPTS):
+        if not current_items:
+            break
+
+        buy_cmd = build_purchase_command(current_items)
+        print(f"🛒 Отправка команды в «{store['name']}»: «{buy_cmd}»")
+
+        # запоминаем последнее сообщение ДО покупки — всё, что новее, относится к этой сделке
+        before_id = get_last_msg_id(store['peer_id'])
+        send_message(store['peer_id'], buy_cmd)
+
+        # ждём ответ, при необходимости сами жмём «Подтвердить»
+        ans_text = wait_for_result(store, before_id)
+        ans_lower = ans_text.lower()
+
+        if not ans_text:
+            print(f"⏳ «{store['name']}» не дала итогового ответа.")
             return
 
-    # ----------------------------------------------------
-    # 2. АДМИН-КОМАНДЫ (/код, /все, /add, /удалить, /очистить, /кто)
-    # ----------------------------------------------------
-    if clean_text.startswith(("/код", "/все", "/add", "/удалить", "/очистить", "/кто")):
-        if user_id != ADMIN_ID:
-            send_msg(peer_id, "⛔ У вас нет доступа к этой команде.")
+        if "нет на складе" in ans_lower:
+            print(f"⏳ Товар раскупили на складе «{store['name']}». Пропускаем.")
             return
 
-        if clean_text == "/кто":
-            lines = [f"👤 Отправитель: {user_id}"]
-            for i, fwd in enumerate(fwd_messages, 1):
-                lines.append(f"📨 Пересланное {i}: from_id = {fwd.get('from_id')}")
-            if len(lines) == 1:
-                lines.append("Перешлите сообщение вместе с командой /кто, и я покажу, чьё оно.")
-            send_msg(peer_id, "\n".join(lines))
+        # ---------- успех ----------
+        if any(k in ans_lower for k in SUCCESS_KEYWORDS) and "куплено за 0" not in ans_lower:
+            for item in current_items:
+                m = re.search(rf"{re.escape(item['name'])}.*?[×xX*]\s*(\d+)", ans_text, re.IGNORECASE)
+                real_qty = int(m.group(1)) if m else item['qty']
+                record_purchase(real_qty, store['name'], item['name'])
+                print(f"✅ Выкуплено: {item['name']} ({real_qty} шт.) в «{store['name']}»!")
+
+            m_left = re.search(r"(?:счет|баланс)[:\s\-]*([\d\s\xa0]+)", ans_text, re.IGNORECASE)
+            if m_left:
+                left = to_int(m_left.group(1))
+                price = current_items[-1]['price']
+                if left is not None and price > 0 and left < price:
+                    store['disabled'] = True
+                    print(f"⚠️ Остаток ({left}) меньше цены ({price}). Отключаем «{store['name']}».")
+                    send_message(MY_USER_ID, f"⚠️ **Баланс исчерпан!** В лавке «{store['name']}» осталось {left}. Лавка отключена.")
             return
 
-        if clean_text == "/код":
-            lines = []
-            with data_lock:
-                for a in ASPECTS:
-                    if a in runes:
-                        val = runes[a]
-                        code_val = val.get("code", "???") if isinstance(val, dict) else str(val)
-                        t_val = val.get("time", 0) if isinstance(val, dict) else 0
-                        t_str = time.strftime("%H:%M", time.localtime(t_val)) if t_val else "время не указано"
-                        lines.append(f"• {a}: `{code_val}` (в {t_str})")
-                    else:
-                        lines.append(f"• {a}: *нет*")
-            msg_text = "💾 **Все собранные коды (Админ):**\n\n" + "\n".join(lines)
-            send_msg(peer_id, msg_text)
-            return
+        # ---------- на складе меньше, чем просили ----------
+        m_stock = re.search(r"Доступно:\s*(\d+)\s*шт\.\s*\"([^\"]+)\"", ans_text, re.IGNORECASE)
+        if m_stock:
+            avail = int(m_stock.group(1))
+            stock_name = m_stock.group(2).lower()
+            for item in current_items:
+                if item['name'].lower() in stock_name:
+                    print(f"⚠️ На складе меньше «{item['name']}»: {item['qty']} → {avail} шт.")
+                    item['qty'] = avail
+                    break
+            continue
 
-        if clean_text.startswith("/все"):
-            broadcast_text = text[4:].strip()
-            if broadcast_text:
-                send_to_work_chats(f"📢 **Общее сообщение:**\n\n{broadcast_text}")
-                send_msg(peer_id, "✅ Сообщение отправлено во все рабочие чаты.")
+        # ---------- не хватает средств ----------
+        m_need = re.search(r"Нужно[:\s\-]*(\d+)", ans_text, re.IGNORECASE)
+        m_bal = re.search(r"(?:доступно|баланс)[:\s\-]*(\d+)", ans_text, re.IGNORECASE)
+
+        if "недостаточно" in ans_lower or (m_need and m_bal):
+            needed = None
+            if m_need and m_bal:
+                needed = int(m_need.group(1))
+                deficit = needed - int(m_bal.group(1))
+                print(f"💡 Недостаточно средств! Нужно: {needed}, баланс: {m_bal.group(1)}, дефицит: {deficit}")
             else:
-                send_msg(peer_id, "⚠️ Формат команды: /все <текст рассылки>")
-            return
+                deficit = 1
+                print("⚠️ Нехватка средств, цифры не распарсились. Уменьшаем заказ.")
 
-        if clean_text.startswith("/add"):
-            parts = text.split()
-            if len(parts) < 3:
-                send_msg(
-                    peer_id,
-                    "⚠️ Формат команды: /add <аспект> <код>\n"
-                    f"Аспекты: {', '.join(ASPECTS)}",
-                )
-                return
-
-            aspect = parts[1].capitalize()
-            code = parts[2]
-            if aspect not in ASPECTS:
-                send_msg(
-                    peer_id,
-                    f"⚠️ Неизвестный аспект «{parts[1]}».\n"
-                    f"Доступные: {', '.join(ASPECTS)}",
-                )
-                return
-
-            trigger_broadcast = False
-            with data_lock:
-                was_complete = len(runes) == len(ASPECTS)
-                runes[aspect] = {"code": code, "time": time.time()}
-                save_data(runes)
-                status_str = get_status_text(runes)
-
-                if len(runes) == len(ASPECTS) and not was_complete:
-                    trigger_broadcast = True
-
-            send_msg(
-                peer_id,
-                f"✅ Аспект «{aspect}» установлен вручную!\n\n{status_str}",
-            )
-
-            if trigger_broadcast:
-                broadcast_notification()
-            return
-
-        if clean_text.startswith("/удалить"):
-            parts = text.split()
-            if len(parts) < 2:
-                send_msg(
-                    peer_id,
-                    "⚠️ Формат команды: /удалить <аспект>\n"
-                    f"Аспекты: {', '.join(ASPECTS)}",
-                )
-                return
-
-            aspect = parts[1].capitalize()
-            if aspect not in ASPECTS:
-                send_msg(
-                    peer_id,
-                    f"⚠️ Неизвестный аспект «{parts[1]}».\n"
-                    f"Доступные: {', '.join(ASPECTS)}",
-                )
-                return
-
-            with data_lock:
-                if aspect in runes:
-                    del runes[aspect]
-                    save_data(runes)
-                    removed = True
-                else:
-                    removed = False
-                status_str = get_status_text(runes)
-
-            if removed:
-                send_msg(peer_id, f"🗑 Аспект «{aspect}» удалён.\n\n{status_str}")
-            else:
-                send_msg(
-                    peer_id,
-                    f"ℹ️ Аспекта «{aspect}» и так нет в базе.\n\n{status_str}",
-                )
-            return
-
-        if clean_text == "/очистить":
-            with data_lock:
-                runes.clear()
-                last_reset_time = time.time()
-                save_data(runes)
-            send_msg(peer_id, "🗑 База рун полностью очищена.")
-            return
-
-    # ----------------------------------------------------
-    # 3. ОБРАБОТКА ТРИГГЕРА АВРОРЫ (ВЫДАЧА КОМБО ИГРОКУ)
-    # ----------------------------------------------------
-    current_time = time.time()
-    trigger_status = check_aurora_trigger(fwd_messages, current_time, user_id)
-
-    if trigger_status == "EXPIRED":
-        send_msg(
-            peer_id,
-            "⚠️ Это сообщение от Авроры слишком старое!\n"
-            "Принимаются только свежие сообщения (не старше 15 минут).",
-        )
-        return
-
-    if trigger_status == "VALID":
-        with data_lock:
-            is_complete = len(runes) == len(ASPECTS)
-            combo_str = " ".join(
-                [
-                    (runes[a]["code"] if isinstance(runes[a], dict) else str(runes[a]))
-                    for a in ASPECTS
-                    if a in runes
-                ]
-            )
-            runes_len = len(runes)
-
-        if is_complete:
-            send_msg(
-                peer_id,
-                f"✅ Запрос принят! Вот все 5 руноблоков:\n\n{combo_str}",
-            )
-        else:
-            send_msg(
-                peer_id,
-                f"⚠️ Собраны еще не все руны ({runes_len}/5). Ожидайте рассылки!",
-            )
-        return
-
-    # ----------------------------------------------------
-    # 4. ОБРАБОТКА ИВЕНТОВ, СБРОСА И СБОРА РУН
-    # ----------------------------------------------------
-
-    # --- А) ИВЕНТЫ И СБРОСЫ (Общий чат RESET_PEER_ID, ТОЛЬКО от Авроры) ---
-    if peer_id == RESET_PEER_ID:
-        if user_id != AURORA_ID:
-            # Чужие сообщения игнорируем. Если пишет какое-то сообщество, оставляем след в логе
-            if user_id < 0 and any(trigger in clean_text for trigger in RESET_TRIGGERS):
-                print(
-                    f"ℹ️ Триггер сброса найден, но отправитель не Аврора "
-                    f"(from_id={user_id}) — игнорирую."
-                )
-            return
-
-        # Сброс алтаря
-        if any(trigger in clean_text for trigger in RESET_TRIGGERS):
-            reset_time_str = time.strftime("%H:%M:%S", time.localtime())
-
-            with data_lock:
-                old_count = len(runes)
-                runes.clear()
-                last_reset_time = time.time()
-                save_data(runes)
-
-            response = (
-                f"🚨 **Алтарь вскрыт! ({reset_time_str})**\n\n"
-                f"• База рун полностью очищена (удалено: {old_count})."
-            )
-            send_to_work_chats(response)
-            return
-
-        # Пробуждение колосса (@online)
-        if (
-            "пробудился" in clean_text
-            and "колосс" in clean_text
-            and "повержен" not in clean_text
-            and "уничтожен" not in clean_text
-            and "заверш" not in clean_text
-        ):
-            boss_match = re.search(r"Пробудился\s+([^.\n!]+)", text, re.IGNORECASE)
-            coords_match = re.search(
-                r"координаты:\s*([-\d]+:[-\d]+)", text, re.IGNORECASE
-            )
-
-            if boss_match and coords_match:
-                boss_name = boss_match.group(1).strip()
-                coords = coords_match.group(1).strip()
-
-                colossus_msg = (
-                    f"@online ☄️ **ОБНАРУЖЕНА УГРОЗА!**\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"👹 **Существо:** {boss_name}\n"
-                    f"📍 **Координаты:** `{coords}`"
-                )
-                send_to_work_chats(colossus_msg)
-
-        # Босс на стене (@all)
-        elif (
-            (
-                "колоссальная сущность" in clean_text
-                or "цель операции:" in clean_text
-            )
-            and "уничтожена" not in clean_text
-            and "повержен" not in clean_text
-            and "заверш" not in clean_text
-        ):
-            event_msg = (
-                f"@all 🛑 **БОЛЬШОЙ БОСС НА СТЕНЕ!**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"👾 В группе пробудился мировой босс!\n"
-                f"⚔️ Переходите к посту на стене и вступайте в бой."
-            )
-            send_to_work_chats(event_msg)
-
-        # Аномальные возмущения (@all)
-        elif (
-            "аномальные возмущения" in clean_text
-            and "заверш" not in clean_text
-            and "изучены" not in clean_text
-        ):
-            event_msg = (
-                f"@all 🧪 **НОВОЕ СОБЫТИЕ НА СТЕНЕ!**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🔬 На стене группы появилось аномальное событие.\n"
-                f"🚀 Пора отправляться на исследование!"
-            )
-            send_to_work_chats(event_msg)
-
-        # Турнир на Арене (@all)
-        elif (
-            (
-                "турнир на арене" in clean_text
-                or "распорядителю арены" in clean_text
-            )
-            and "окончен" not in clean_text
-            and "завершен" not in clean_text
-        ):
-            event_msg = (
-                f"@all 🏟 **ТУРНИР НА АРЕНЕ!**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"⚔️ Через 30 минут начинается турнир на арене Хром-Гарна!"
-            )
-            send_to_work_chats(event_msg)
-
-    # --- Б) СБОРЫ И ТАЙМЕРЫ (Рабочие чаты, ТОЛЬКО пересланное от Атраксиса) ---
-    if peer_id in RUNES_PEER_IDS:
-        if process_game_forwards(msg, peer_id, user_id, fwd_messages):
-            return
-
-        # --- В) СБОР РУН ---
-        for fwd in fwd_messages:
-            # Принимаем только сообщения, пересланные от сообщества Атраксис
-            if fwd.get("from_id") != ATRAXIS_ID:
-                continue
-
-            fwd_date = fwd.get("date", int(current_time))
-
-            # Игнорируем сообщения, отправленные до последнего сброса
-            if fwd_date <= last_reset_time:
-                continue
-
-            fwd_text = fwd.get("text", "")
-            fwd_text_lower = fwd_text.lower()
-
-            if (current_time - fwd_date) <= 1800 or user_id == ADMIN_ID:
-                if (
-                    "реликвия активна" in fwd_text_lower
-                    and "аспект:" in fwd_text_lower
-                ):
-                    match = re.search(
-                        r"Аспект:\s*([А-Яа-яЁё]+)", fwd_text, re.IGNORECASE
-                    )
-                    if not match:
-                        continue
-
-                    aspect = match.group(1).capitalize()
-                    code = None
-
-                    code_match = re.search(r"\((.*?)\)", fwd_text)
-                    if code_match:
-                        code = code_match.group(1).strip()
-                    else:
-                        lines = [
-                            line.strip()
-                            for line in fwd_text.splitlines()
-                            if line.strip()
-                        ]
-                        for idx, line in enumerate(lines):
-                            if "аспект:" in line.lower():
-                                if idx + 1 < len(lines):
-                                    code = lines[idx + 1]
-                                break
-
-                    if aspect in ASPECTS and code:
-                        trigger_broadcast = False
-                        with data_lock:
-                            was_complete = len(runes) == len(ASPECTS)
-                            runes[aspect] = {"code": code, "time": fwd_date}
-                            save_data(runes)
-                            status_str = get_status_text(runes)
-
-                            if len(runes) == len(ASPECTS) and not was_complete:
-                                trigger_broadcast = True
-
-                        response_msg = f"✅ Аспект «{aspect}» сохранен!\n\n{status_str}"
-                        send_msg(peer_id, response_msg)
-                        delete_msg(msg.get("id"))
-
-                        if trigger_broadcast:
-                            broadcast_notification()
-                        break
-
-
-# ==========================================
-# 🚀 ИНИЦИАЛИЗАЦИЯ И ОСНОВНОЙ ЦИКЛ
-# ==========================================
-vk_session = vk_api.VkApi(token=TOKEN)
-vk = vk_session.get_api()
-
-with data_lock:
-    runes = load_data()
-load_stats()
-load_timers()
-
-
-def main():
-    print(
-        f"🤖 Юзербот запущен. Admin ID: {ADMIN_ID} | "
-        f"Aurora ID: {AURORA_ID} | Atraxis ID: {ATRAXIS_ID}"
-    )
-    threading.Thread(target=scheduler_loop, daemon=True).start()
-
-    while True:
-        try:
-            longpoll = VkLongPoll(vk_session)
-
-            for event in longpoll.listen():
-                if event.type != VkEventType.MESSAGE_NEW or event.from_me:
+            while deficit > 0 and current_items:
+                last = current_items[-1]
+                unit = last['price']
+                if unit <= 0 and needed and last['qty'] > 0:
+                    unit = needed // last['qty']
+                if unit <= 0:
+                    current_items.pop()
                     continue
 
-                # Ошибка в одном сообщении не должна перезапускать весь longpoll
-                try:
-                    with api_lock:
-                        msg_data = vk.messages.getById(message_ids=event.message_id)
-                    if not msg_data.get("items"):
-                        continue
-                    handle_message(msg_data["items"][0])
-                except Exception:
-                    print(f"⚠️ Ошибка обработки сообщения {event.message_id}:")
-                    traceback.print_exc()
+                reduce_qty = (deficit + unit - 1) // unit if needed else 1
+                if reduce_qty < last['qty']:
+                    last['qty'] -= reduce_qty
+                    deficit -= reduce_qty * unit
+                    print(f"✂️ «{last['name']}» −{reduce_qty} шт. Новый заказ: {last['qty']} шт.")
+                else:
+                    deficit -= last['qty'] * unit
+                    print(f"🗑️ «{current_items.pop()['name']}» убрана из заказа.")
 
-        except Exception as e:
-            print(f"⚠️ Ошибка VK / LongPoll: {e}")
+            if not current_items:
+                store['disabled'] = True
+                print(f"⚠️ Баланс в «{store['name']}» исчерпан. Отключаем лавку.")
+                send_message(MY_USER_ID, f"⚠️ **Недостаточно баланса!** В лавке «{store['name']}» закончились средства.")
+                return
+            continue
+
+        print(f"❓ Непонятный ответ лавки «{store['name']}»: {ans_text[:200]!r}")
+        return
+
+
+# ============================== ГЛАВНЫЙ ЦИКЛ ==============================
+def main():
+    global last_check_time, last_processed_msg_id
+    print("🚀 Скрипт авто-покупки матриц запущен!")
+
+    if not VK_TOKEN:
+        print("❌ КРИТИЧЕСКАЯ ОШИБКА: VK_TOKEN не задан!")
+        return
+
+    is_active = True
+    last_processed_msg_id = get_last_msg_id_user(MY_USER_ID)
+
+    while True:
+        is_active = check_commands(is_active)
+        if is_active:
+            last_check_time = time.strftime("%H:%M:%S (%d.%m)")
+            for store in STORES:
+                try:
+                    check_store(store)
+                except Exception as e:
+                    print(f"💥 Ошибка при работе с «{store['name']}»: {e}")
+                time.sleep(random.randint(5, 10))
+
+            wait_seconds = random.randint(20 * 60, 40 * 60)
+            print(f"⏳ Следующий цикл проверки через {wait_seconds // 60} минут...\n")
+        else:
+            print("💤 Бот на паузе (/off)...", end="\r")
+            wait_seconds = 10
+
+        elapsed = 0
+        while elapsed < wait_seconds:
             time.sleep(5)
+            elapsed += 5
+            is_active = check_commands(is_active)
+
+
+def get_last_msg_id_user(user_id):
+    data = vk_api_request("messages.getHistory", {'user_id': user_id, 'count': 1})
+    if data and 'response' in data:
+        items = data['response'].get('items', [])
+        if items:
+            return items[0].get('id', 0)
+    return 0
 
 
 if __name__ == "__main__":
