@@ -307,6 +307,13 @@ def period_range(period, now_ts):
 # ==========================================
 RE_BRACKET = re.compile(r"\[\s*(III|II|I)\s*\]")
 RE_TRAIL = re.compile(r"\s(III|II|I)\s*[.!]?\s*$")
+RE_TIER = re.compile(r"\(\s*[TТtт]\s*(\d+)\s*\)")  # (T5), латиница или кириллица
+
+
+def tier_of(line):
+    """Тир ресурса из строки вида «… (T5)». Нет тира — 0."""
+    m = RE_TIER.search(line)
+    return int(m.group(1)) if m else 0
 
 
 def is_gather_start(text):
@@ -325,6 +332,7 @@ def parse_gather(text):
         return None
 
     res = []
+    tiers = []
     spheres = notes = signs = 0
     dup_line = None
 
@@ -341,6 +349,7 @@ def parse_gather(text):
         m = RE_BRACKET.search(line)
         if m and "найден" not in l:
             res.append(ROMAN[m.group(1)])
+            tiers.append(tier_of(line))
             continue
 
         if "{" in line:
@@ -354,6 +363,7 @@ def parse_gather(text):
                 t = RE_TRAIL.search(line)
                 if t:
                     res.append(ROMAN[t.group(1)])
+                    tiers.append(tier_of(line))
 
     bonus_res = bonus_sph = 0
     if dup_line is not None:
@@ -375,6 +385,11 @@ def parse_gather(text):
         for g in res:
             grades[g] += 1
 
+    # Материя: только серые (I), равна тиру; если бонус задвоил сам ресурс, то вдвое больше
+    materia = sum(tr for g, tr in zip(res, tiers) if g == 0)
+    if bonus_res:
+        materia *= 2
+
     return {
         "mode": mode,
         "g": grades,
@@ -383,6 +398,7 @@ def parse_gather(text):
         "bs": bonus_sph,
         "n": notes,
         "z": signs,
+        "mt": materia,
         "ok": bool(res or spheres or notes or signs),
     }
 
@@ -420,7 +436,7 @@ def fmt_recorded(name, recs):
 def aggregate(recs):
     out = {}
     for mode in ("v", "r"):
-        out[mode] = {"c": 0, "g": [0, 0, 0], "bg": 0, "s": 0, "bs": 0, "n": 0, "z": 0}
+        out[mode] = {"c": 0, "g": [0, 0, 0], "bg": 0, "s": 0, "bs": 0, "n": 0, "z": 0, "mt": 0}
     for r in recs:
         a = out.get(r.get("m"))
         if a is None:
@@ -433,6 +449,7 @@ def aggregate(recs):
         a["bs"] += r.get("bs", 0)
         a["n"] += r.get("n", 0)
         a["z"] += r.get("z", 0)
+        a["mt"] += r.get("mt", 0)
     return out
 
 
@@ -451,6 +468,7 @@ def format_stats(recs, scope_title, period_title):
     sph = v["s"] + r["s"]
     notes = v["n"] + r["n"]
     signs = v["z"] + r["z"]
+    materia = v["mt"] + r["mt"]
     total_res = sum(g)
 
     # Первая строка длинная и без эмодзи: VK тянет пузырь по самой длинной строке,
@@ -460,7 +478,7 @@ def format_stats(recs, scope_title, period_title):
         lines.append("Сборов пока нет.")
         return "\n".join(lines)
 
-    lines += [f"🔢 Сборов: {c}", f"{PICK} Ресурсов: {total_res}", ""]
+    lines += [f"🔢 Сборов: {c}", f"{PICK} Ресурсов: {total_res}", f"🔮 Материя: {materia}", ""]
     for emoji, i in (("⚪", 0), ("🔵", 1), ("🟣", 2)):
         lines.append(f"{emoji} {g[i]} — {fmt_pct(g[i], total_res)}")
     lines += ["", f"📦 Сферы: {sph}", f"📜 Заметки: {notes}", f"🎖 Знаки: {signs}"]
@@ -607,35 +625,40 @@ def short_name(full):
 
 
 def top_rows(peer_id, start, end, limit=10):
-    """Топ игроков чата за период: [(имя, всего ресурсов, фиолетовых)].
-    Сортировка по общему числу ресурсов, при равенстве по фиолетовым."""
+    """Топ игроков чата за период: [(имя, всего ресурсов, фиолетовых, материя)].
+    Сортировка по общему числу ресурсов, при равенстве по фиолетовым, затем по материи."""
     with stats_lock:
         recs = list(stats.get(str(peer_id), []))
     agg = {}
     for r in recs:
         if r["t"] < start or (end is not None and r["t"] >= end):
             continue
-        a = agg.setdefault(r["u"], [0, 0])
+        a = agg.setdefault(r["u"], [0, 0, 0])
         a[0] += sum(r["g"])
         a[1] += r["g"][2]
-    rows = [(u, tot, vio) for u, (tot, vio) in agg.items() if tot > 0]
-    rows.sort(key=lambda x: (-x[1], -x[2], x[0]))
-    return [(short_name(get_full_name(u)), tot, vio) for u, tot, vio in rows[:limit]]
+        a[2] += r.get("mt", 0)
+    rows = [(u, tot, vio, mat) for u, (tot, vio, mat) in agg.items() if tot > 0]
+    rows.sort(key=lambda x: (-x[1], -x[2], -x[3], x[0]))
+    return [(short_name(get_full_name(u)), tot, vio, mat) for u, tot, vio, mat in rows[:limit]]
 
 
 def format_top(rows, head):
-    """Две строки на игрока, имя на всю ширину пузыря, медаль во второй строке:
+    """Три строки на игрока, между игроками пустая строка:
     Иван Иванов
-    🥇 ⛏️ 200 · 🟣 20"""
+    🥇 ⛏️ 200 · 🟣 20
+    🔮 Материя: 45"""
     lines = [head, ""]
     if not rows:
         lines.append("Пока нет ресурсов.")
         return "\n".join(lines)
     medals = ["🥇", "🥈", "🥉"]
-    for i, (name, tot, vio) in enumerate(rows):
+    for i, (name, tot, vio, mat) in enumerate(rows):
         mark = medals[i] if i < 3 else f"{i + 1}."
+        if i:
+            lines.append("")
         lines.append(name)
         lines.append(f"{mark} {PICK} {tot} · 🟣 {vio}")
+        lines.append(f"🔮 Материя: {mat}")
     return "\n".join(lines)
 
 
@@ -749,7 +772,7 @@ HELP_USER = (
     "\n"
     "Просто пересылайте сюда сообщения от Атраксиса: бот сам запишет ресурсы, "
     "поставит таймер на босса и исследование и удалит ваше сообщение. "
-    "Если приписать к пересланному подпись, сообщение останется.\n\n"
+    "Если приписать подпись или переслать вместе с логом начала сбора, сообщение останется.\n\n"
     "📊 /стата [общая] [сегодня | вчера | неделя | месяц | всё] — статистика сборов\n"
     "🏆 /топ — топ по ресурсам за неделю, /топ месяц, /топ всё (за всё время)\n"
     "⏳ /таймеры — ваши активные таймеры\n"
@@ -1091,6 +1114,7 @@ def process_game_forwards(msg, peer_id, user_id, fwd_messages):
     timer_events = []
     unparsed = 0
     recognized = False
+    has_start = False
 
     for fwd in fwd_messages:
         if fwd.get("from_id") != ATRAXIS_ID:
@@ -1115,6 +1139,7 @@ def process_game_forwards(msg, peer_id, user_id, fwd_messages):
                 "bs": g["bs"],
                 "n": g["n"],
                 "z": g["z"],
+                "mt": g["mt"],
             })
             continue
 
@@ -1125,7 +1150,7 @@ def process_game_forwards(msg, peer_id, user_id, fwd_messages):
             continue
 
         if is_gather_start(ftext):
-            recognized = True  # сообщение о начале сбора просто удаляем
+            has_start = True  # лог начала сбора: сам по себе ничего не значит, но и удалять его не нужно
 
     if not recognized:
         return False
@@ -1164,10 +1189,10 @@ def process_game_forwards(msg, peer_id, user_id, fwd_messages):
         mid = send_msg(peer_id, line)
         schedule_delete(mid, REMINDER_TTL)
 
-    # Своё пересланное сообщение удаляем только если оно «голое»: без подписи и всё разобрано.
-    # Если игрок что-то приписал («круто!», хвастаемся), сообщение остаётся, но сбор всё равно записан.
+    # Своё пересланное сообщение удаляем только если оно «голое»: без подписи, без лога начала сбора
+    # и всё разобрано. Иначе сообщение остаётся (хвастаемся), но сбор всё равно записан.
     has_caption = bool((msg.get("text") or "").strip())
-    if unparsed == 0 and not has_caption:
+    if unparsed == 0 and not has_caption and not has_start:
         delete_msg(msg.get("id"))
     return True
 
