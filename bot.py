@@ -820,7 +820,9 @@ def handle_help_command(peer_id, user_id, clean_text):
 # ==========================================
 def timer_kind(text):
     low = text.lower()
-    if "следующая атака" in low:
+    # Удар по колоссу («Урон по колоссу… Следующая атака через 1м») таймера не получает:
+    # часовой таймер только на удар по мировому боссу.
+    if "следующая атака" in low and "по колосс" not in low:
         return "boss"
     if "следующее исследование" in low:
         return "research"
