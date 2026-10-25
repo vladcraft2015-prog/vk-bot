@@ -1,1 +1,3 @@
 vk_api
+pymorphy3
+pymorphy3-dicts-ru
