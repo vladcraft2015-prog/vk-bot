@@ -1,10 +1,13 @@
 import hashlib
 import json
+import math
 import os
+import random
 import re
 import threading
 import time
 import traceback
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import vk_api
@@ -64,6 +67,16 @@ TIMER_STALE = 2 * 3600    # если бот был выключен дольше
 CUSTOM_MIN = 10           # свой таймер: минимум 10 секунд
 CUSTOM_MAX = 24 * 3600    # свой таймер: максимум 24 часа
 CUSTOM_LIMIT = 5          # не больше 5 своих таймеров на игрока в чате
+
+# --- Шифр Цезаря (терминал ИИ Авроры приходит в личку с Атраксисом) ---
+CIPHER_FORWARD = True     # игроки пересылают терминал в рабочий чат, бот отвечает расшифровкой
+CIPHER_TTL = 60           # через сколько секунд удалять и ответ бота, и пересланный терминал
+CIPHER_AUTO = False       # решать шифр сам, когда терминал приходит в личку аккаунту бота
+CIPHER_GUESS = True       # если слова нет в словаре, отвечать «по звучанию», когда бот очень уверен
+CIPHER_MARGIN = 8.0       # порог уверенности для CIPHER_GUESS (больше: отвечает реже, но точнее)
+CIPHER_DELAY = (2, 4)     # пауза перед ответом в игру, секунд (от и до)
+CIPHER_NOTIFY_ID = ADMIN_ID   # кому писать, когда бот не уверен или игра сказала «неверно»
+CIPHER_WORDS_FILE = os.path.join(DATA_DIR, "cipher_words.json")  # слова, которые бот выучил сам
 
 # Московское время (без перехода на летнее/зимнее)
 MSK = timezone(timedelta(hours=3))
@@ -212,6 +225,42 @@ def delete_msg(message_id):
         return False
 
 
+def delete_by_cmid(peer_id, cmid):
+    """Удаление по номеру сообщения внутри беседы (если у reply_message нет обычного id)."""
+    if not cmid:
+        return False
+    try:
+        with api_lock:
+            vk.messages.delete(peer_id=peer_id, cmids=[cmid], delete_for_all=1)
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось удалить сообщение cmid={cmid} в {peer_id}: {e}")
+        return False
+
+
+DEL_WORDS = {"дел", "делл", "dell", "del", "/дел", "/del", "/dell"}
+
+
+def handle_delete_command(msg, peer_id, user_id, clean_text):
+    """Админ отвечает «дел» на любое сообщение: бот удаляет его и саму команду."""
+    if user_id != ADMIN_ID or clean_text.strip(" .!") not in DEL_WORDS:
+        return False
+    reply = msg.get("reply_message")
+    if not reply:
+        return False  # без ответа это просто слово, ничего не делаем
+    if reply.get("id"):
+        ok = delete_msg(reply["id"])
+    else:
+        ok = delete_by_cmid(peer_id, reply.get("conversation_message_id"))
+    delete_msg(msg.get("id"))
+    if not ok:
+        schedule_delete(
+            send_msg(peer_id, "⚠️ Не получилось удалить сообщение: нужны права администратора беседы."),
+            WARNING_TTL,
+        )
+    return True
+
+
 def schedule_delete(message_id, delay, now=None):
     """Ставит собственное сообщение бота в очередь на удаление через delay секунд."""
     if not message_id:
@@ -258,6 +307,10 @@ def broadcast_notification():
 
 def check_aurora_trigger(fwd_messages, current_time, user_id):
     for fwd in fwd_messages:
+        # Только настоящее сообщение игры, пересланное от Атраксиса. Ответ на сообщение самого
+        # бота (в рассылке «Алтарь готов» эта фраза процитирована) или чужой текст не считаются.
+        if fwd.get("from_id") != ATRAXIS_ID:
+            continue
         if AURORA_TRIGGER in fwd.get("text", ""):
             fwd_date = fwd.get("date", 0)
             if (current_time - fwd_date) <= 900 or user_id == ADMIN_ID:
@@ -770,7 +823,7 @@ def post_period_tops(now=None):
 HELP_USER = (
     "📖 Команды\n"
     "\n"
-    "Просто пересылайте сюда сообщения от Атраксиса: бот сам запишет ресурсы, "
+    "Пересылайте сюда сообщения от Атраксиса: бот сам запишет ресурсы, "
     "поставит таймер на босса и исследование и удалит ваше сообщение. "
     "Если приписать подпись или переслать вместе с логом начала сбора, сообщение останется.\n\n"
     "📊 /стата [общая] [сегодня | вчера | неделя | месяц | всё] — статистика сборов\n"
@@ -778,6 +831,7 @@ HELP_USER = (
     "⏳ /таймеры — ваши активные таймеры\n"
     "⏰ /таймер 45м кузница — свой таймер (45м, 1ч30м, 90)\n"
     "🗑 /отмена [босс | исследование | свои] — отменить таймеры\n"
+    "🔐 Терминал с шифром просто перешлите сюда: бот пришлёт ответ и через минуту всё удалит\n"
     "📜 /статус — сколько рун собрано\n"
     "🏓 /пинг — проверить, что бот жив"
 )
@@ -785,10 +839,12 @@ HELP_USER = (
 HELP_ADMIN = (
     "🛠 Админ-команды\n"
     "\n"
+    "🧽 дел — ответом на чужое сообщение: бот удалит его и вашу команду (нужны права админа беседы)\n"
     "💾 /код — все собранные коды рун\n"
     "➕ /add <аспект> <код> — внести руну вручную\n"
     "➖ /удалить <аспект> — удалить одну руну\n"
     "🗑 /очистить — очистить базу рун\n"
+    "🔐 /шифр+ <слово> — добавить слово в словарь шифра, /шифр- <слово> — убрать выученное\n"
     "📢 /все <текст> — рассылка во все рабочие чаты\n"
     "🧹 /стата сброс — очистить статистику этого чата\n"
     "🔎 /кто — перешлите сообщение с этой командой, бот покажет его from_id\n"
@@ -1200,6 +1256,524 @@ def process_game_forwards(msg, peer_id, user_id, fwd_messages):
 
 
 # ==========================================
+# 🔐 ШИФР ЦЕЗАРЯ (ТЕРМИНАЛ ИИ АВРОРЫ)
+# ==========================================
+# Как работает. Аврора в личке с Атраксисом присылает «Зашифрована фраза: «пёпэк»». Алфавит из 33 букв
+# (с ё), сдвиг от 1 до 32 в любую сторону (сдвиг вперёд на k = сдвиг назад на 33-k, поэтому перебираем
+# все 33 варианта). Дальше бот ищет настоящее слово по очереди так:
+#   1) среди вариантов ответа (кнопки клавиатуры или строки под текстом), если они есть;
+#   2) в словаре (встроенный список + слова, которые бот выучил после «Расшифровка верна»), с учётом
+#      окончаний: «архив» и «архивы», «звезда» и «звёзды» считаются одним словом;
+#   3) по «звучанию» (буквенные пары, обученные на словаре). Так бот отвечает, только если очень уверен.
+# Если не уверен, ответ в игру НЕ отправляется, а CIPHER_NOTIFY_ID получает лучшие варианты.
+CIPHER_ALPHA = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+CIPHER_N = len(CIPHER_ALPHA)
+_C_IDX = {c: i for i, c in enumerate(CIPHER_ALPHA)}
+_C_VOWELS = set("аеёиоуыэюя")
+_C_ENDINGS = sorted(
+    ["ами", "ями", "ов", "ев", "ей", "ом", "ем", "ам", "ям", "ах", "ях", "ою", "ею", "ые", "ие",
+     "ых", "их", "ий", "ый", "ой", "ая", "яя", "ое", "ее", "ую", "юю", "ы", "и", "а", "я", "у",
+     "ю", "е", "о", "ь", "й"],
+    key=len, reverse=True,
+)
+_C_FREQ = {
+    "о": 10.97, "е": 8.45, "а": 8.01, "и": 7.35, "н": 6.70, "т": 6.26, "с": 5.47, "р": 4.73,
+    "в": 4.54, "л": 4.34, "к": 3.49, "м": 3.21, "д": 2.98, "п": 2.81, "у": 2.62, "я": 2.01,
+    "ы": 1.90, "ь": 1.74, "г": 1.69, "з": 1.65, "б": 1.59, "ч": 1.45, "й": 1.21, "х": 0.97,
+    "ж": 0.94, "ш": 0.72, "ю": 0.64, "ц": 0.49, "щ": 0.36, "э": 0.33, "ф": 0.26, "ъ": 0.04,
+    "ё": 0.25,
+}
+_C_UNI = {c: math.log(f / 3.03) for c, f in _C_FREQ.items()}
+_C_BIGRAMS = set(
+    "ст но то на ен ов ни ра во ко не по ор ро ть ли ал ре ер ан ат от ел ти ка ий ри ва ин ес ол "
+    "ис ие ль ла ик ем да ча ны ых ам ог ом ту ск ак ус ур ци он ия ир ит ап ар ос ей ки ед ож те "
+    "му ве ше нн тр пр пе ое ая ый ой ма ме ми мо ну".split()
+)
+
+# Встроенный словарь (имена существительные и прилагательные в начальной форме).
+# Можно спокойно дописывать свои слова: через пробел или с новой строки.
+CIPHER_SEED_WORDS = """
+авангард аврора агент агрегат адаптер азот акула алгоритм аллея алмаз алмазы алтарь альянс амбар
+ангар андроид антенна антиматерия аппарат арена армия артефакт архив архивы аспект атака атом аура
+аэродром база балка баррикада бастион батарея башни башня бесконечность бетон биомасса бита блок
+болото бомба бронеплита броня бумага бункер буря бусина бутылка вагон вакуум вакцина вектор вентиль
+вестник ветер вечность вилка вирус вихрь вишня вода воздух воин волк волна вопрос ворон ворота
+восточный время вспышка высота выстрел вышка вьюга газета галактика гараж гарнизон гвоздь гелий
+генератор гильза глина гнездо голем голограмма голос гора горн город гранат граница гром груша гряда
+гусеница датчик дверь двигатель действие демон дерево детектор диапазон диск добыча дождь доклад
+долина дорога доспех дракон дрейф дрон дроны дуга дым железо жетон жидкий жидкость жизнь жила жрец
+жук журнал забвение заброшка завод загадка заглушка задание задача залив замки замок западный запас
+заряд засада защита защёлка заяц звезда звено зверь звёзды здоровье земля зенит зеркало зерно змея
+знак знание золото зона иглу излучение изумруд икона иллюзия имплант импульс инженер инструмент
+интерфейс инфекция искра испытание источник кабели кабель кабина калибр камень камни канал канистра
+каньон капитан капсула капуста карантин каркас карта картофель каталог катушка квадрат кварц киборг
+кинжал клетка климат клинок клуб ключ ключи книга кнопка кнут код колба колесо колонист колонна
+колосс командир комета компас конвой контейнер контроль контур копьё корабли корабль корень корпус
+косяк кошка кран кратер крепость кристалл кристаллы кровать крыло кубок кузница купол курс лабиринт
+лаборатория лавина лагерь лампа ландшафт лента лес линза линия лиса литий лифт ловкость ловушка
+ложка локатор лось лук люк лёгкий лёд маг магистраль магнит мантия маршрут маска масло мастерская
+материал маяк маяки маятник медведь медик медь мембрана металл метеорит механизм механик меч мина
+минерал миссия мишень многоножка модификатор модуль молекула молния молоко молот монета монстр
+монстры морковь мост мотор муравей мусор мутант мутация муфта мышь набор навигатор навык наноробот
+наследие насос недра нефть нить новичок нож нуль обелиск обломок оболочка образец обрыв объект объём
+огонь огурец окно олень оптика опыт орбита оружейная оружие орёл осколок остров острый ответ отряд
+охотник охотники охрана очаг очищение палуба память панели панель паника пароль парус пассажир паук
+пепел перевал передатчик периметр перо перчатки песок пещера пещеры пилон пилот письмо плазма пламя
+планета планеты плащ плита пломба плоскость плотина площадка поверхность погрузчик подвал подземелье
+подъезд поле полигон помидор порох порт портал порядок посох пост поток потолок предмет привод
+призрак призраки приманка прицел пробирка провод провода проводник прожектор пропасть пространство
+протез протокол процессор прыжок пулемёт пульт пункт пустошь пустыня пыль работа равнина радар
+радары радиация разведчик раздел разлом разум ракета рана расселина реагент реактор реакторы ребро
+регулятор резерв река реликвия рельеф ремень ресурс решение риф робот роботы рой рубеж рубин рубины
+руда руды руна ручей рыцарь рычаг сад самолёт сапоги сапфир сварка свекла свет светлый свиток связь
+северный секрет сектор семья семя сенсор сенсоры серверная серебро сетка сигнал сигналы сила символ
+синтез система скала скафандр склад склон скорость след слива слиток смерть смесь снаряд снег собака
+собор сова солдат сосуд спираль спора спутник средство стабильность сталь станции станция статья
+ствол стелла стена стержень стол страж стрела стрелок струна стул ступень субстрат сундук сфера
+схема схрон счётчик съёмка таблетка таймер тайна тайник танк тарелка твёрдый тень терминал терраса
+тигель титан титаны токсин тоннель топливник топливо топор торговец торпеда трава тревога труба
+туман туманность туннель турбина турель тьма тяжёлый тёмный угол уголь удача узел улей улика
+ультиматум упаковка уровень урон усилитель установка учёный ущелье фабрика фараон фермент фильтр
+флаг флот фонарь формула форпост фрагмент фронт хаос хижина хищник хлеб храм хранилище хребет
+хрупкий цвет цель центр цепь цех цикл цирк цистерна часы чаша чашка чаща червь чертёж чип чудак
+чудовище шаблон шахта шахты шестерня шип шифратор шкала шкаф шлем шлюз шнур шпиль штаб шторм штурм
+щель щит щука щётка эвакуация экзамен экран экраны эксперимент электрон эмблема эмиттер энергия
+энциклопедия эпицентр эпоха эскадра этаж этап эфир эхо юбка юг южный юла юнит яблоко яд ядро якорь
+яма янтари янтарь ящик ёж ёлка
+"""
+
+_C_WORD_RE = re.compile(r"[а-яё]+")
+_cipher_lock = threading.RLock()
+_cipher_state = {"known": set(), "stems": set(), "scorer": None, "learned": []}
+_cipher_pending = {}   # {peer_id: {"answer": ..., "words": [...], "at": ...}} ответ ждёт вердикта игры
+_cipher_seen = []      # id уже обработанных сообщений терминала
+
+
+def _c_shift(text, k):
+    """Сдвиг каждой буквы вперёд на k по 33-буквенному алфавиту. Остальные символы не трогаем."""
+    return "".join(
+        CIPHER_ALPHA[(_C_IDX[c] + k) % CIPHER_N] if c in _C_IDX else c for c in text
+    )
+
+
+def _c_shift_label(k):
+    if k == 0:
+        return "без сдвига"
+    return f"+{k}" if k <= CIPHER_N // 2 else f"−{CIPHER_N - k}"
+
+
+def _c_fold(w):
+    return w.replace("ё", "е")
+
+
+def cipher_stem(w):
+    """Слово без окончания: «архивы» и «архив» дают одну основу, «звёзды» и «звезда» тоже."""
+    w = _c_fold(w)
+    for e in _C_ENDINGS:
+        if w.endswith(e) and len(w) - len(e) >= 3:
+            return w[: -len(e)]
+    return w
+
+
+def _c_rules(w):
+    """Очки «русскости» слова по правилам и число грубых нарушений (ыы, ьь, жы, 4 согласных подряд…)."""
+    n = len(w)
+    if not n:
+        return 0.0, 0
+    bad = 0
+    sc = 0.0
+    vow = sum(1 for c in w if c in _C_VOWELS)
+    for c in w:
+        sc += _C_UNI.get(c, -3.0)
+    if w[0] in "ъыь":
+        bad += 1
+    if n >= 3 and vow == 0:
+        bad += 1
+    run_c = run_v = 0
+    for i, c in enumerate(w):
+        prev = w[i - 1] if i else ""
+        nxt = w[i + 1] if i + 1 < n else ""
+        if c in _C_VOWELS:
+            run_v += 1
+            run_c = 0
+        elif c in "ьъ":
+            run_c = run_v = 0
+        else:
+            run_c += 1
+            run_v = 0
+        if run_c >= 4 or run_v >= 4:
+            bad += 1
+        if c == "ь" and (prev in _C_VOWELS or prev in ("й", "ь", "ъ")):
+            bad += 1
+        if c == "ъ" and (nxt not in ("е", "ё", "ю", "я") or prev in _C_VOWELS):
+            bad += 1
+        if c in "ыяю" and prev in "жшчщ":
+            bad += 1
+        if c == "ы" and prev in "гкх":
+            bad += 1
+        if prev == c and c in "ыьъэюяё":
+            bad += 1
+        if c == "й" and prev and prev not in _C_VOWELS:
+            bad += 1
+        if prev and (prev + c) in _C_BIGRAMS:
+            sc += 0.9
+    ratio = vow / n
+    if n >= 4 and (ratio < 0.2 or ratio > 0.75):
+        bad += 1
+    return sc - 6 * bad, bad
+
+
+def _c_make_scorer(words):
+    """Обучает модель буквенных пар и троек на словаре. Возвращает функцию слово -> (очки, нарушения)."""
+    big, ctx, tri, tctx = Counter(), Counter(), Counter(), Counter()
+    for w in words:
+        s = "^" + w + "$"
+        for a, b in zip(s, s[1:]):
+            big[(a, b)] += 1
+            ctx[a] += 1
+        for a, b, c in zip(s, s[1:], s[2:]):
+            tri[(a, b, c)] += 1
+            tctx[(a, b)] += 1
+    size = CIPHER_N + 1
+
+    def score(w):
+        s = "^" + w + "$"
+        lp = 0.0
+        for a, b, c in zip(s, s[1:], s[2:]):
+            p2 = (big[(b, c)] + 0.3) / (ctx[b] + 0.3 * size)
+            p3 = (tri[(a, b, c)] + 1.5 * p2) / (tctx[(a, b)] + 1.5)
+            lp += math.log(p3)
+        rs, bad = _c_rules(w)
+        return lp + 0.25 * rs, bad
+
+    return score
+
+
+def _c_rebuild():
+    """Пересобирает словарь и модель (после запуска и после каждого выученного слова)."""
+    with _cipher_lock:
+        words = set(_C_WORD_RE.findall(CIPHER_SEED_WORDS.lower())) | set(_cipher_state["learned"])
+        _cipher_state["known"] = {_c_fold(w) for w in words}
+        _cipher_state["stems"] = {cipher_stem(w) for w in words if len(cipher_stem(w)) >= 4}
+        _cipher_state["scorer"] = _c_make_scorer([w for w in words if len(w) >= 3])
+
+
+def load_cipher_words():
+    raw = _load_json(CIPHER_WORDS_FILE, {})
+    with _cipher_lock:
+        _cipher_state["learned"] = [w for w in raw.get("words", []) if isinstance(w, str)]
+    _c_rebuild()
+
+
+def learn_cipher_words(words):
+    """Добавляет слова в выученные. Возвращает, сколько действительно новых."""
+    added = 0
+    with _cipher_lock:
+        for w in words:
+            w = w.lower().strip()
+            if len(w) < 3 or not _C_WORD_RE.fullmatch(w):
+                continue
+            if _c_fold(w) in _cipher_state["known"]:
+                continue
+            _cipher_state["learned"].append(w)
+            _cipher_state["known"].add(_c_fold(w))
+            added += 1
+        if added:
+            _save_json(CIPHER_WORDS_FILE, {"words": _cipher_state["learned"]})
+    if added:
+        _c_rebuild()
+    return added
+
+
+def forget_cipher_words(words):
+    removed = 0
+    with _cipher_lock:
+        for w in words:
+            w = w.lower().strip()
+            if w in _cipher_state["learned"]:
+                _cipher_state["learned"].remove(w)
+                removed += 1
+        if removed:
+            _save_json(CIPHER_WORDS_FILE, {"words": _cipher_state["learned"]})
+    if removed:
+        _c_rebuild()
+    return removed
+
+
+def _c_known_level(w):
+    """2: слово есть в словаре, 1: есть с другим окончанием (мн. число, падеж), 0: неизвестно."""
+    wf = _c_fold(w)
+    with _cipher_lock:
+        if wf in _cipher_state["known"]:
+            return 2
+        s = cipher_stem(wf)
+        if len(s) >= 4 and s in _cipher_state["stems"]:
+            return 1
+    return 0
+
+
+def cipher_candidates(phrase, scorer=None):
+    """Все 33 варианта расшифровки, лучшие по «русскости» первыми."""
+    phrase = phrase.lower().strip()
+    with _cipher_lock:
+        scorer = scorer or _cipher_state["scorer"]
+    cands = []
+    for k in range(CIPHER_N):
+        dec = _c_shift(phrase, k)
+        words = _C_WORD_RE.findall(dec)
+        if not words:
+            continue
+        sc = 0.0
+        bad = 0
+        levels = []
+        for w in words:
+            s, b = scorer(w)
+            sc += s
+            bad += b
+            levels.append(_c_known_level(w))
+        cands.append({
+            "k": k, "text": dec, "score": sc, "bad": bad,
+            "exact": min(levels) == 2, "known": min(levels) >= 1,
+        })
+    cands.sort(key=lambda c: -c["score"])
+    return cands
+
+
+def solve_cipher(phrase, options=None, scorer=None):
+    """Ищет расшифровку. Возвращает {"answer", "how", "sure", "cands", "note"}.
+    sure=True означает, что бот готов отправить answer в игру без подтверждения."""
+    cands = cipher_candidates(phrase, scorer)
+    res = {"answer": None, "how": None, "sure": False, "cands": cands, "note": ""}
+    if not cands:
+        res["note"] = "в фразе нет русских букв"
+        return res
+
+    # 1) варианты ответа из самой игры
+    if options:
+        opt_map = {}
+        for o in options:
+            opt_map.setdefault(_c_fold(o.lower().strip()), o.strip())
+        hits = [c for c in cands if _c_fold(c["text"]) in opt_map]
+        if not hits:
+            stems = {}
+            for key, label in opt_map.items():
+                st = cipher_stem(key)
+                if len(st) >= 4:
+                    stems.setdefault(st, label)
+            hits = [c for c in cands if cipher_stem(_c_fold(c["text"])) in stems]
+            if hits:
+                key = cipher_stem(_c_fold(hits[0]["text"]))
+                res.update(answer=stems[key], how="options", sure=len(hits) == 1, best=hits[0])
+                return res
+        else:
+            best = hits[0]
+            res.update(
+                answer=opt_map[_c_fold(best["text"])], how="options", best=best,
+                sure=len(hits) == 1 or best["score"] - hits[1]["score"] >= 3,
+            )
+            return res
+        res["note"] = "ни один вариант из игры не совпал с расшифровкой"
+
+    # 2) словарь
+    pool = [c for c in cands if c["exact"]] or [c for c in cands if c["known"]]
+    if pool:
+        best = pool[0]
+        sure = len(pool) == 1 or best["score"] - pool[1]["score"] >= 3
+        res.update(answer=best["text"], how="dict", sure=sure, best=best)
+        return res
+
+    # 3) «на слух»
+    best = cands[0]
+    margin = best["score"] - cands[1]["score"] if len(cands) > 1 else 99.0
+    res.update(
+        answer=best["text"], how="model", best=best,
+        sure=CIPHER_GUESS and best["bad"] == 0 and margin >= CIPHER_MARGIN,
+    )
+    res["margin"] = margin
+    return res
+
+
+HOW_LABELS = {
+    "options": "совпало с вариантом из игры",
+    "dict": "слово есть в словаре",
+    "model": "угадано по звучанию",
+}
+
+
+def format_cipher_candidates(cands, limit=5):
+    lines = []
+    for i, c in enumerate(cands[:limit], 1):
+        mark = "📗" if c["exact"] else ("📙" if c["known"] else "▫️")
+        lines.append(f"{i}) {mark} {c['text']} (сдвиг {_c_shift_label(c['k'])})")
+    return "\n".join(lines)
+
+
+def cipher_notify(text):
+    """Пишет админу. Если ему написать нельзя (VK не пускает), дублирует в рабочий чат."""
+    if send_msg(CIPHER_NOTIFY_ID, text) is None:
+        send_msg(RUNES_PEER_IDS[-1], text)
+
+
+def extract_cipher_options(msg, text):
+    """Варианты ответа: кнопки клавиатуры сообщения, а если их нет, строки под «Выбери расшифровку»."""
+    opts = []
+    kb = msg.get("keyboard") or {}
+    for row in kb.get("buttons") or []:
+        for btn in row:
+            act = btn.get("action", {}) if isinstance(btn, dict) else {}
+            label = (act.get("label") or "").strip()
+            if label:
+                opts.append(label)
+    if not opts:
+        i = text.lower().find("выбери расшифровку")
+        if i >= 0:
+            for line in text[i:].split("\n")[1:]:
+                line = re.sub(r"^[\s\-–•*\d.)]+", "", line).strip()
+                if line:
+                    opts.append(line)
+    return opts
+
+
+def _cipher_worker(peer_id, phrase, options):
+    try:
+        res = solve_cipher(phrase, options)
+        cands = res["cands"]
+        if res["answer"] and res["sure"]:
+            time.sleep(random.uniform(*CIPHER_DELAY))
+            if send_msg(peer_id, res["answer"]) is None:
+                cipher_notify(f"⚠️ Шифр «{phrase}»: расшифровал как «{res['answer']}», но отправить в игру не вышло.")
+                return
+            words = _C_WORD_RE.findall(res["answer"].lower())
+            _cipher_pending[peer_id] = {"answer": res["answer"], "words": words, "at": time.time()}
+            print(f"🔐 Шифр «{phrase}» → «{res['answer']}» ({HOW_LABELS.get(res['how'], res['how'])})")
+            return
+        head = f"🔐 Шифр «{phrase}»: не уверен, в игру ничего не отправил."
+        if res["note"]:
+            head += f"\n({res['note']})"
+        if options:
+            head += "\nВарианты из игры: " + ", ".join(options)
+        cipher_notify(head + "\n\nЛучшие расшифровки:\n" + format_cipher_candidates(cands)
+                      + "\n\n📗 слово из словаря, 📙 то же слово с другим окончанием."
+                      + "\nПравильное слово можно добавить: /шифр+ слово")
+        print(f"🔐 Шифр «{phrase}»: не уверен, отправил варианты в {CIPHER_NOTIFY_ID}")
+    except Exception:
+        print("⚠️ Ошибка решателя шифра:")
+        traceback.print_exc()
+
+
+def handle_cipher_message(msg, peer_id, text):
+    """Сообщения Атраксиса: терминал с шифром и вердикт игры. True, если сообщение наше."""
+    low = text.lower()
+    if "зашифрована фраза" in low:
+        if not CIPHER_AUTO:
+            return False
+        mid = msg.get("id")
+        with _cipher_lock:
+            if mid in _cipher_seen:
+                return True
+            _cipher_seen.append(mid)
+            del _cipher_seen[:-50]
+        m = re.search(r"[«“\"]([^»”\"]+)[»”\"]", text)
+        if not m:
+            print("⚠️ Шифр: не нашёл фразу в «кавычках».")
+            return True
+        options = extract_cipher_options(msg, text)
+        threading.Thread(
+            target=_cipher_worker, args=(peer_id, m.group(1).strip(), options), daemon=True
+        ).start()
+        return True
+
+    if "расшифровка" in low:
+        pend = _cipher_pending.pop(peer_id, None)
+        if not pend or time.time() - pend["at"] > 900:
+            return True
+        if "неверн" in low or "не верн" in low or "❌" in text:
+            cipher_notify(
+                f"❌ Шифр: я ответил «{pend['answer']}», но игра сказала, что это неверно. "
+                f"Слово в словарь не добавлял."
+            )
+        elif "верна" in low or "✅" in text:
+            if learn_cipher_words(pend["words"]):
+                print(f"🔐 Выучил слово: {', '.join(pend['words'])}")
+        return True
+    return False
+
+
+def handle_cipher_forward(msg, peer_id, user_id, fwd_messages):
+    """Рабочий чат: игрок переслал терминал Авроры. Отвечаем расшифровкой и через минуту
+    удаляем и ответ, и пересланное сообщение. True, если в пересылке был терминал с шифром."""
+    if not CIPHER_FORWARD:
+        return False
+    found = False
+    for fwd in fwd_messages:
+        if fwd.get("from_id") != ATRAXIS_ID:
+            continue
+        ftext = fwd.get("text") or ""
+        if "зашифрована фраза" not in ftext.lower():
+            continue
+        m = re.search(r"[«“\"]([^»”\"]+)[»”\"]", ftext)
+        if not m:
+            continue
+        found = True
+        phrase = m.group(1).strip()
+        res = solve_cipher(phrase)
+        if not res["cands"]:
+            text = f"🔐 «{phrase}»: в фразе нет русских букв."
+        elif res["sure"]:
+            text = f"🔐 «{phrase}» → {res['answer']}"
+            if res["how"] == "model":
+                text += "\n(угадано по звучанию, слова нет в словаре)"
+        else:
+            text = (
+                f"🔐 «{phrase}»: не уверен. Похожие варианты:\n"
+                + format_cipher_candidates(res["cands"], 3)
+            )
+        schedule_delete(send_msg(peer_id, text), CIPHER_TTL)
+        print(f"🔐 Шифр «{phrase}» → «{res['answer']}» ({res['how']}, sure={res['sure']}) для {user_id}")
+    if found:
+        schedule_delete(msg.get("id"), CIPHER_TTL)
+    return found
+
+
+def handle_cipher_command(peer_id, user_id, text):
+    """/шифр <фраза> — показать расшифровки; /шифр+ и /шифр- <слова> — словарь (админ)."""
+    tokens = text.split()
+    if not tokens or tokens[0].lower() not in ("/шифр", "/шифр+", "/шифр-"):
+        return False
+    head, args = tokens[0].lower(), tokens[1:]
+
+    if head in ("/шифр+", "/шифр-"):
+        if user_id != ADMIN_ID:
+            send_msg(peer_id, "⛔ У вас нет доступа к этой команде.")
+            return True
+        if not args:
+            send_msg(peer_id, f"⚠️ Формат команды: {head} <слово> [слово ...]")
+            return True
+        if head == "/шифр+":
+            n = learn_cipher_words(args)
+            send_msg(peer_id, f"✅ Добавлено новых слов: {n} (остальные уже были в словаре).")
+        else:
+            n = forget_cipher_words(args)
+            send_msg(peer_id, f"🗑 Удалено выученных слов: {n} (встроенные слова не удаляются).")
+        return True
+
+    if not args:
+        send_msg(peer_id, "⚠️ Формат команды: /шифр <зашифрованное слово>")
+        return True
+    res = solve_cipher(" ".join(args))
+    if not res["cands"]:
+        send_msg(peer_id, "⚠️ В тексте нет русских букв.")
+        return True
+    verdict = "✅ Уверен" if res["sure"] else "🤔 Не уверен"
+    send_msg(
+        peer_id,
+        f"🔐 {verdict}: {res['answer']} ({HOW_LABELS.get(res['how'], '')})\n\n"
+        + format_cipher_candidates(res["cands"]),
+    )
+    return True
+
+
+# ==========================================
 # 📨 ОБРАБОТКА ОДНОГО СООБЩЕНИЯ
 # ==========================================
 def handle_message(msg):
@@ -1217,6 +1791,14 @@ def handle_message(msg):
         fwd_messages.append(msg["reply_message"])
 
     clean_text = text.lower()
+
+    # «дел» ответом на сообщение (только админ): удалить его и саму команду
+    if handle_delete_command(msg, peer_id, user_id, clean_text):
+        return
+
+    # Терминал шифра от ИИ Авроры и вердикт игры приходят от Атраксиса (обычно в личке с ним)
+    if user_id == ATRAXIS_ID and handle_cipher_message(msg, peer_id, text):
+        return
 
     # ----------------------------------------------------
     # 1. ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ В БЕСЕДАХ
@@ -1258,6 +1840,10 @@ def handle_message(msg):
         if handle_top_command(peer_id, user_id, clean_text):
             return
         if handle_timer_commands(peer_id, user_id, clean_text, text):
+            return
+        if handle_cipher_command(peer_id, user_id, text):
+            return
+        if handle_cipher_forward(msg, peer_id, user_id, fwd_messages):
             return
 
     # ----------------------------------------------------
@@ -1608,6 +2194,7 @@ with data_lock:
     runes = load_data()
 load_stats()
 load_timers()
+load_cipher_words()
 
 
 def main():
