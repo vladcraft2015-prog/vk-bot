@@ -70,7 +70,7 @@ CUSTOM_LIMIT = 5          # не больше 5 своих таймеров на
 
 # --- Шифр Цезаря (терминал ИИ Авроры приходит в личку с Атраксисом) ---
 CIPHER_FORWARD = True     # игроки пересылают терминал в рабочий чат, бот отвечает расшифровкой
-CIPHER_TTL = 15           # через сколько секунд удалять и ответ бота, и пересланный терминал
+CIPHER_TTL = 60           # через сколько секунд удалять и ответ бота, и пересланный терминал
 CIPHER_AUTO = False       # решать шифр сам, когда терминал приходит в личку аккаунту бота
 CIPHER_GUESS = True       # если слова нет в словаре, отвечать «по звучанию», когда бот очень уверен
 CIPHER_MARGIN = 8.0       # порог уверенности для CIPHER_GUESS (больше: отвечает реже, но точнее)
@@ -1290,6 +1290,21 @@ _C_BIGRAMS = set(
     "му ве ше нн тр пр пе ое ая ый ой ма ме ми мо ну".split()
 )
 
+# Слова, которые реально встречались в игре. Дописывайте новые сюда (или командой /шифр+ в чате).
+# Достаточно одной формы: «архивы» покрывает и «архив», «парсек» покрывает «парсеки».
+CIPHER_GAME_WORDS = """
+доступ луна парсек архивы масса пламя поле сетка черт ядро вирус титан мрак пульт модуль
+полёт космос орбита
+"""
+
+# Необязательно: если на сервере стоит pymorphy3 (pip install pymorphy3 pymorphy3-dicts-ru),
+# бот узнаёт настоящие русские существительные и без словаря. Без библиотеки этот шаг пропускается.
+try:
+    import pymorphy3
+    _c_morph = pymorphy3.MorphAnalyzer()
+except Exception:
+    _c_morph = None
+
 # Встроенный словарь (имена существительные и прилагательные в начальной форме).
 # Можно спокойно дописывать свои слова: через пробел или с новой строки.
 CIPHER_SEED_WORDS = """
@@ -1452,7 +1467,11 @@ def _c_make_scorer(words):
 def _c_rebuild():
     """Пересобирает словарь и модель (после запуска и после каждого выученного слова)."""
     with _cipher_lock:
-        words = set(_C_WORD_RE.findall(CIPHER_SEED_WORDS.lower())) | set(_cipher_state["learned"])
+        words = (
+            set(_C_WORD_RE.findall(CIPHER_SEED_WORDS.lower()))
+            | set(_C_WORD_RE.findall(CIPHER_GAME_WORDS.lower()))
+            | set(_cipher_state["learned"])
+        )
         _cipher_state["known"] = {_c_fold(w) for w in words}
         _cipher_state["stems"] = {cipher_stem(w) for w in words if len(cipher_stem(w)) >= 4}
         _cipher_state["scorer"] = _c_make_scorer([w for w in words if len(w) >= 3])
@@ -1512,6 +1531,18 @@ def _c_known_level(w):
     return 0
 
 
+def _c_is_noun(w):
+    """Настоящее русское существительное в именительном падеже (ед. или мн. число). Нужен pymorphy3."""
+    if _c_morph is None or len(w) < 3:
+        return False
+    for p in _c_morph.parse(w):
+        single = p.tag.number == "sing" and _c_fold(p.normal_form) == _c_fold(w)
+        plural = p.tag.number == "plur"
+        if p.is_known and p.tag.POS == "NOUN" and p.tag.case == "nomn" and (single or plural):
+            return True
+    return False
+
+
 def cipher_candidates(phrase, scorer=None):
     """Все 33 варианта расшифровки, лучшие по «русскости» первыми."""
     phrase = phrase.lower().strip()
@@ -1534,6 +1565,7 @@ def cipher_candidates(phrase, scorer=None):
         cands.append({
             "k": k, "text": dec, "score": sc, "bad": bad,
             "exact": min(levels) == 2, "known": min(levels) >= 1,
+            "noun": _c_morph is not None and all(_c_is_noun(w) for w in words),
         })
     cands.sort(key=lambda c: -c["score"])
     return cands
@@ -1582,7 +1614,18 @@ def solve_cipher(phrase, options=None, scorer=None):
         res.update(answer=best["text"], how="dict", sure=sure, best=best)
         return res
 
-    # 3) «на слух»
+    # 3) настоящие существительные по pymorphy3 (если библиотека установлена)
+    nouns = [c for c in cands if c["noun"]]
+    if nouns:
+        best = nouns[0]
+        sure = len(nouns) == 1 or best["score"] - nouns[1]["score"] >= CIPHER_MARGIN
+        res.update(
+            answer=best["text"], how="morph", sure=sure, best=best,
+            cands=nouns + [c for c in cands if not c["noun"]],
+        )
+        return res
+
+    # 4) «на слух»
     best = cands[0]
     margin = best["score"] - cands[1]["score"] if len(cands) > 1 else 99.0
     res.update(
@@ -1596,6 +1639,7 @@ def solve_cipher(phrase, options=None, scorer=None):
 HOW_LABELS = {
     "options": "совпало с вариантом из игры",
     "dict": "слово есть в словаре",
+    "morph": "настоящее существительное (pymorphy3)",
     "model": "угадано по звучанию",
 }
 
@@ -1603,7 +1647,7 @@ HOW_LABELS = {
 def format_cipher_candidates(cands, limit=5):
     lines = []
     for i, c in enumerate(cands[:limit], 1):
-        mark = "📗" if c["exact"] else ("📙" if c["known"] else "▫️")
+        mark = "📗" if c["exact"] else ("📙" if c["known"] else ("📘" if c.get("noun") else "▫️"))
         lines.append(f"{i}) {mark} {c['text']} (сдвиг {_c_shift_label(c['k'])})")
     return "\n".join(lines)
 
@@ -1653,7 +1697,7 @@ def _cipher_worker(peer_id, phrase, options):
         if options:
             head += "\nВарианты из игры: " + ", ".join(options)
         cipher_notify(head + "\n\nЛучшие расшифровки:\n" + format_cipher_candidates(cands)
-                      + "\n\n📗 слово из словаря, 📙 то же слово с другим окончанием."
+                      + "\n\n📗 слово из словаря, 📙 то же слово с другим окончанием, 📘 настоящее существительное."
                       + "\nПравильное слово можно добавить: /шифр+ слово")
         print(f"🔐 Шифр «{phrase}»: не уверен, отправил варианты в {CIPHER_NOTIFY_ID}")
     except Exception:
