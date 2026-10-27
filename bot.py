@@ -77,6 +77,8 @@ CIPHER_MARGIN = 8.0       # порог уверенности для CIPHER_GUES
 CIPHER_DELAY = (2, 4)     # пауза перед ответом в игру, секунд (от и до)
 CIPHER_NOTIFY_ID = ADMIN_ID   # кому писать, когда бот не уверен или игра сказала «неверно»
 CIPHER_WORDS_FILE = os.path.join(DATA_DIR, "cipher_words.json")  # слова, которые бот выучил сам
+TIERS_FILE = os.path.join(DATA_DIR, "resource_tiers.json")        # тир каждого ресурса по названию
+PRICES_FILE = os.path.join(DATA_DIR, "prices.json")               # цены, обновлённые командами /цены и /цена
 
 # Московское время (без перехода на летнее/зимнее)
 MSK = timezone(timedelta(hours=3))
@@ -361,12 +363,355 @@ def period_range(period, now_ts):
 RE_BRACKET = re.compile(r"\[\s*(III|II|I)\s*\]")
 RE_TRAIL = re.compile(r"\s(III|II|I)\s*[.!]?\s*$")
 RE_TIER = re.compile(r"\(\s*[TТtт]\s*(\d+)\s*\)")  # (T5), латиница или кириллица
+# Количество в конце строки: «[×3]». Крестик бывает настоящим ×, латинской x или русской х.
+RE_QTY = re.compile(r"\s*[\[(]\s*[×xXхХ]\s*(\d{1,4})\s*[\])]\s*$")
+RE_QTY_ALONE = re.compile(r"\n[ \t]*([\[(]\s*[×xXхХ]\s*\d{1,4}\s*[\])])[ \t]*(?=\n|$)")
 
 
 def tier_of(line):
     """Тир ресурса из строки вида «… (T5)». Нет тира — 0."""
     m = RE_TIER.search(line)
     return int(m.group(1)) if m else 0
+
+
+# ==========================================
+# 🧱 ТИРЫ РЕСУРСОВ ПО НАЗВАНИЮ (для материи с исследований)
+# ==========================================
+# В сборах тир написан в скобках: «Грубое волокно (Т3)». В исследованиях его нет: «Каменная крошка I».
+# Поэтому бот помнит тир каждого ресурса по названию: запоминает сам, когда видит тир в скобках, и
+# берёт из таблицы, когда его нет. Недостающие тиры админ добавляет командой /тир.
+# Весь список можно вставить прямо сюда: "название ресурса": тир (строчными, «ё» писать как «е»).
+RESOURCE_TIERS_SEED = {
+    "грубое волокно": 3,
+    "качественная руда": 4,
+}
+tiers_lock = threading.Lock()
+resource_tiers = dict(RESOURCE_TIERS_SEED)
+unknown_tiers = {}  # название -> сколько раз встретилось без тира
+
+
+def load_tiers():
+    raw = _load_json(TIERS_FILE, {})
+    with tiers_lock:
+        resource_tiers.update({k: int(v) for k, v in raw.get("tiers", {}).items()})
+        unknown_tiers.update({k: int(v) for k, v in raw.get("unknown", {}).items()})
+        for k in list(unknown_tiers):
+            if k in resource_tiers:
+                del unknown_tiers[k]
+
+
+def _save_tiers():
+    _save_json(TIERS_FILE, {"tiers": resource_tiers, "unknown": unknown_tiers})
+
+
+def res_name(line):
+    """Название ресурса из строки: только русские слова, без кружков, грейда, тира и количества."""
+    clean = RE_TIER.sub(" ", line)
+    words = re.findall(r"[А-Яа-яЁё]{2,}", clean)
+    return " ".join(words).lower().replace("ё", "е")
+
+
+def resolve_tier(line):
+    """Тир ресурса: из скобок (и запоминаем), а если их нет, из таблицы по названию."""
+    name = res_name(line)
+    tr = tier_of(line)
+    if tr:
+        if name:
+            with tiers_lock:
+                if resource_tiers.get(name) != tr:
+                    resource_tiers[name] = tr
+                    unknown_tiers.pop(name, None)
+                    _save_tiers()
+        return tr
+    if not name:
+        return 0
+    with tiers_lock:
+        tr = resource_tiers.get(name, 0)
+        if not tr:
+            new = name not in unknown_tiers
+            unknown_tiers[name] = unknown_tiers.get(name, 0) + 1
+            if new:
+                _save_tiers()
+    return tr
+
+
+RE_TIER_LINE = re.compile(r"^\s*(.+?)\s*[-—–:=]*\s*\(?\s*[TТtт]?\s*(\d{1,2})\s*\)?\s*$")
+
+
+def handle_tier_command(peer_id, user_id, text):
+    """/тир — какие ресурсы без тира; /тир Название 3 — записать (можно списком, по строке на ресурс)."""
+    parts = text.strip().split(None, 1)
+    if not parts or parts[0].lower() != "/тир":
+        return False
+    if user_id != ADMIN_ID:
+        send_msg(peer_id, "⛔ У вас нет доступа к этой команде.")
+        return True
+    body = parts[1] if len(parts) > 1 else ""
+    if not body.strip():
+        with tiers_lock:
+            unk = sorted(unknown_tiers.items(), key=lambda kv: -kv[1])[:25]
+            known = len(resource_tiers)
+        lines = [f"🧱 Ресурсов с известным тиром: {known}"]
+        if unk:
+            lines.append("\n❓ Без тира (сколько раз встретились):")
+            lines += [f"• {n} ×{c}" for n, c in unk]
+            lines.append("\nЗапись: /тир Название 3 (можно списком, по строке на ресурс)")
+        else:
+            lines.append("Все встреченные ресурсы с тиром ✅")
+        send_msg(peer_id, "\n".join(lines))
+        return True
+    done, bad = 0, []
+    for raw in body.splitlines():
+        if not raw.strip():
+            continue
+        m = RE_TIER_LINE.match(raw)
+        name = res_name(m.group(1)) if m else ""
+        if not m or not name or int(m.group(2)) <= 0:
+            bad.append(raw.strip())
+            continue
+        with tiers_lock:
+            resource_tiers[name] = int(m.group(2))
+            unknown_tiers.pop(name, None)
+        done += 1
+    with tiers_lock:
+        _save_tiers()
+    msg = f"✅ Записано тиров: {done}"
+    if bad:
+        msg += "\n⚠️ Не разобрал: " + "; ".join(bad[:5])
+    send_msg(peer_id, msg)
+    return True
+
+
+# ==========================================
+# 💰 ЦЕНЫ РЕСУРСОВ (для команды /доход)
+# ==========================================
+# Прайс лавки в том виде, как его выдаёт игра: «Т3:» задаёт тир, дальше строки «Название I|II|III - цена».
+# Из него бот берёт и цены, и тиры ресурсов. Цены меняются: обновляйте командой /цены (см. /помощь).
+PRICE_LIST_SEED = """
+Т1:
+⚪️ Рваное волокно I - 855
+⚪️ Дырявая шкура I - 879
+⚪️ Каменная крошка I - 855
+⚪️ Надтреснутый кристалл I - 855
+⚪️ Рассыпчатая руда I - 855
+🔵 Рваное волокно II - 9263
+🔵 Дырявая шкура II - 12960
+🔵 Каменная крошка II - 12518
+🔵 Надтреснутый кристалл II - 11291
+🔵 Рассыпчатая руда II - 12471
+🟣 Рваное волокно III - 38658
+🟣 Дырявая шкура III - 48050
+🟣 Каменная крошка III - 46593
+🟣 Надтреснутый кристалл III - 41947
+🟣 Рассыпчатая руда III - 46555
+Т2:
+⚪️ Цельное волокно I - 1826
+⚪️ Потрепанная шкура I - 1942
+⚪️ Мутная руда I - 1862
+⚪️ Цельный кристалл I - 1965
+⚪️ Пористый камень I - 1933
+🔵 Цельное волокно II - 19676
+🔵 Потрепанная шкура II - 22909
+🔵 Мутная руда II - 22308
+🔵 Цельный кристалл II - 21863
+🔵 Пористый камень II - 22347
+🟣 Цельное волокно III - 78011
+🟣 Потрепанная шкура III - 78221
+🟣 Мутная руда III - 74223
+🟣 Цельный кристалл III - 71584
+🟣 Пористый камень III - 76988
+Т3:
+⚪️ Грубое волокно I - 2779
+⚪️ Тонкая шкура I - 2838
+⚪️ Твердый камень I - 2867
+⚪️ Прочный кристалл I - 2796
+⚪️ Насыщенная руда I - 2888
+🔵 Грубое волокно II - 23070
+🔵 Тонкая шкура II - 26417
+🔵 Твердый камень II - 26543
+🔵 Прочный кристалл II - 24343
+🔵 Насыщенная руда II - 26099
+🟣 Грубое волокно III - 86596
+🟣 Тонкая шкура III - 96850
+🟣 Твердый камень III - 96468
+🟣 Прочный кристалл III - 84313
+🟣 Насыщенная руда III - 96189
+Т4:
+⚪️ Плотное волокно I - 3855
+⚪️ Плотная шкура I - 4067
+⚪️ Плотный камень I - 3886
+⚪️ Качественный кристалл I - 3943
+⚪️ Качественная руда I - 3800
+🔵 Плотное волокно II - 28759
+🔵 Плотная шкура II - 33260
+🔵 Плотный камень II - 32496
+🔵 Качественный кристалл II - 29574
+🔵 Качественная руда II - 30947
+🟣 Плотное волокно III - 98188
+🟣 Плотная шкура III - 109580
+🟣 Плотный камень III - 117663
+🟣 Качественный кристалл III - 98268
+🟣 Качественная руда III - 109371
+Т5:
+⚪️ Крепкое волокно I - 4869
+⚪️ Прочная шкура I - 4923
+⚪️ Качественный камень I - 5069
+⚪️ Усиленный кристалл I - 4869
+⚪️ Чистая руда I - 4869
+🔵 Крепкое волокно II - 33055
+🔵 Прочная шкура II - 39034
+🔵 Качественный камень II - 40578
+🔵 Усиленный кристалл II - 33967
+🔵 Чистая руда II - 36575
+🟣 Крепкое волокно III - 109188
+🟣 Прочная шкура III - 139817
+🟣 Качественный камень III - 138973
+🟣 Усиленный кристалл III - 127519
+🟣 Чистая руда III - 129293
+Т6:
+⚪️ Усиленное волокно I - 6080
+⚪️ Жесткая шкура I - 6154
+⚪️ Усиленный камень I - 6080
+⚪️ Заряженный кристалл I - 6080
+⚪️ Закаленная руда I - 6080
+🔵 Усиленное волокно II - 38698
+🔵 Жесткая шкура II - 47414
+🔵 Усиленный камень II - 49383
+🔵 Заряженный кристалл II - 41672
+🔵 Закаленная руда II - 44667
+🟣 Усиленное волокно III - 123120
+🟣 Жесткая шкура III - 156966
+🟣 Усиленный камень III - 166480
+🟣 Заряженный кристалл III - 138510
+🟣 Закаленная руда III - 153900
+Т7:
+⚪️ Идеальное волокно I - 7875
+⚪️ Усиленная шкура I - 7875
+⚪️ Рунический камень I - 7875
+⚪️ Рунический кристалл I - 7875
+⚪️ Заряженная руда I - 7875
+🔵 Идеальное волокно II - 52500
+🔵 Усиленная шкура II - 60900
+🔵 Рунический камень II - 60974
+🔵 Рунический кристалл II - 51300
+🔵 Заряженная руда II - 55100
+🟣 Идеальное волокно III - 167924
+🟣 Усиленная шкура III - 204750
+🟣 Рунический камень III - 204750
+🟣 Рунический кристалл III - 189000
+🟣 Заряженная руда III - 194870
+⛏️ Сфера трансформации - 12649
+"""
+RE_PRICE_TIER = re.compile(r"^\s*[TТтt]\s*(\d{1,2})\s*:?\s*$")
+RE_PRICE_ROW = re.compile(r"^\W*?\s*([А-Яа-яЁё][А-Яа-яЁё ]+?)\s+(III|II|I)\s*[-–—]\s*(\d+)")
+RE_PRICE_SPHERE = re.compile(r"[Сс]фера\s+трансформации\s*[-–—]\s*(\d+)")
+ROMAN_TO_GRADE = {"I": 0, "II": 1, "III": 2}
+GRADE_EMOJI = {0: "⚪", 1: "🔵", 2: "🟣"}
+prices = {}              # "название|грейд" -> цена за штуку (грейд 0, 1, 2 = I, II, III)
+sphere_price = [0]       # цена одной сферы трансформации
+
+
+def apply_price_list(text, persist=True):
+    """Разбирает прайс из текста. Возвращает (цен, тиров, цена сферы или None)."""
+    n_prices = n_tiers = 0
+    tier = 0
+    sphere = None
+    with tiers_lock:
+        for line in text.splitlines():
+            m = RE_PRICE_TIER.match(line)
+            if m:
+                tier = int(m.group(1))
+                continue
+            m = RE_PRICE_ROW.match(line)
+            if m:
+                name = res_name(m.group(1))
+                if not name:
+                    continue
+                prices[f"{name}|{ROMAN_TO_GRADE[m.group(2)]}"] = int(m.group(3))
+                n_prices += 1
+                if tier and resource_tiers.get(name) != tier:
+                    resource_tiers[name] = tier
+                    unknown_tiers.pop(name, None)
+                    n_tiers += 1
+            ms = RE_PRICE_SPHERE.search(line)
+            if ms:
+                sphere = int(ms.group(1))
+                sphere_price[0] = sphere
+        if persist:
+            _save_prices()
+            _save_tiers()
+    return n_prices, n_tiers, sphere
+
+
+def _save_prices():
+    _save_json(PRICES_FILE, {"prices": prices, "sphere": sphere_price[0]})
+
+
+def load_prices():
+    raw = _load_json(PRICES_FILE, {})
+    with tiers_lock:
+        prices.update({k: int(v) for k, v in raw.get("prices", {}).items()})
+        if raw.get("sphere"):
+            sphere_price[0] = int(raw["sphere"])
+
+
+def fmt_money(n):
+    return f"{int(n):,}".replace(",", "\u00a0")
+
+
+apply_price_list(PRICE_LIST_SEED, persist=False)
+
+RE_PRICE_ONE = re.compile(r"^\s*([А-Яа-яЁё][А-Яа-яЁё ]*?)\s+(III|II|I)\s*[-–—=:]?\s*(\d+)\s*$")
+RE_PRICE_SPH_ONE = re.compile(r"^\s*сфер\w*\s*[-–—=:]?\s*(\d+)\s*$", re.I)
+PRICE_USAGE = (
+    "ℹ️ Цены ресурсов (админ):\n"
+    "/цены + список лавки — обновить сразу много (если не влезает, двумя сообщениями)\n"
+    "/цена Рваное волокно II 9300 — одна цена\n"
+    "/цена сфера 13000 — цена сферы"
+)
+
+
+def handle_price_command(peer_id, user_id, text):
+    parts = text.strip().split(None, 1)
+    head = parts[0].lower() if parts else ""
+    if head not in ("/цена", "/цены"):
+        return False
+    if user_id != ADMIN_ID:
+        send_msg(peer_id, "⛔ У вас нет доступа к этой команде.")
+        return True
+    body = parts[1] if len(parts) > 1 else ""
+    if not body.strip():
+        send_msg(peer_id, PRICE_USAGE + f"\n\nСейчас в таблице цен: {len(prices)}, сфера: {fmt_money(sphere_price[0])}")
+        return True
+    if head == "/цены":
+        n_p, n_t, sph = apply_price_list(body)
+        if not n_p and sph is None:
+            send_msg(peer_id, "⚠️ Не нашёл ни одной цены. Нужны строки вида: Рваное волокно I - 855")
+            return True
+        msg = f"✅ Обновлено цен: {n_p}"
+        if n_t:
+            msg += f", тиров: {n_t}"
+        if sph is not None:
+            msg += f", сфера: {fmt_money(sph)}"
+        send_msg(peer_id, msg)
+        return True
+    m = RE_PRICE_SPH_ONE.match(body)
+    if m:
+        with tiers_lock:
+            sphere_price[0] = int(m.group(1))
+            _save_prices()
+        send_msg(peer_id, f"✅ Сфера: {fmt_money(sphere_price[0])}")
+        return True
+    m = RE_PRICE_ONE.match(body)
+    name = res_name(m.group(1)) if m else ""
+    if not m or not name:
+        send_msg(peer_id, PRICE_USAGE)
+        return True
+    with tiers_lock:
+        prices[f"{name}|{ROMAN_TO_GRADE[m.group(2)]}"] = int(m.group(3))
+        _save_prices()
+    send_msg(peer_id, f"✅ {name.capitalize()} {m.group(2)}: {fmt_money(m.group(3))}")
+    return True
 
 
 def is_gather_start(text):
@@ -386,13 +731,23 @@ def parse_gather(text):
 
     res = []
     tiers = []
+    names = []
     spheres = notes = signs = 0
     dup_line = None
+
+    # «[×3]» бывает перенесено на отдельную строку: приклеиваем к предмету выше
+    text = RE_QTY_ALONE.sub(r" \1", text)
 
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
+        # «[×3]» в конце строки: предмета выдано несколько штук (ресурсы, сферы, заметки, знаки)
+        qty = 1
+        qm = RE_QTY.search(line)
+        if qm:
+            qty = max(1, int(qm.group(1)))
+            line = line[: qm.start()].strip()
         l = line.lower()
 
         if "бонусы дублируют" in l:
@@ -401,22 +756,24 @@ def parse_gather(text):
 
         m = RE_BRACKET.search(line)
         if m and "найден" not in l:
-            res.append(ROMAN[m.group(1)])
-            tiers.append(tier_of(line))
+            res.extend([ROMAN[m.group(1)]] * qty)
+            tiers.extend([resolve_tier(line)] * qty)
+            names.extend([res_name(line)] * qty)
             continue
 
         if "{" in line:
             if "сфер" in l:
-                spheres += 1
+                spheres += qty
             elif "заметк" in l:
-                notes += 1
+                notes += qty
             elif "знак" in l:
-                signs += 1
+                signs += qty
             else:
                 t = RE_TRAIL.search(line)
                 if t:
-                    res.append(ROMAN[t.group(1)])
-                    tiers.append(tier_of(line))
+                    res.extend([ROMAN[t.group(1)]] * qty)
+                    tiers.extend([resolve_tier(line)] * qty)
+                    names.extend([res_name(line)] * qty)
 
     bonus_res = bonus_sph = 0
     if dup_line is not None:
@@ -443,8 +800,15 @@ def parse_gather(text):
     if bonus_res:
         materia *= 2
 
+    # Состав добычи для /доход: «название|грейд» -> штук (бонус-дубль удваивает)
+    items = {}
+    for nm, gr in zip(names, res):
+        key = f"{nm}|{gr}"
+        items[key] = items.get(key, 0) + (2 if bonus_res else 1)
+
     return {
         "mode": mode,
+        "items": items,
         "g": grades,
         "bg": bonus_res,
         "s": spheres + bonus_sph,
@@ -559,9 +923,9 @@ STATS_USAGE = (
 )
 
 
-def parse_stats_command(clean_text):
+def parse_stats_command(clean_text, heads=STATS_HEADS):
     tokens = clean_text.split()
-    if not tokens or tokens[0] not in STATS_HEADS:
+    if not tokens or tokens[0] not in heads:
         return None
     args = tokens[1:]
 
@@ -610,6 +974,96 @@ def handle_stats_command(peer_id, user_id, clean_text):
     ]
     scope_title = "Общая" if cmd["scope"] == "all" else "Моя"
     send_msg(peer_id, format_stats(recs, scope_title, period_title))
+    return True
+
+
+# ==========================================
+# 💰 КОМАНДА /доход
+# ==========================================
+INCOME_HEADS = ("/доход", "/income")
+INCOME_USAGE = (
+    "ℹ️ Формат: /доход [общая] [сегодня | вчера | неделя | месяц | всё]\n"
+    "Примеры: /доход, /доход неделя, /доход общая месяц"
+)
+
+
+def format_income(recs, scope_title, period_title):
+    """Сколько стоит добытое по ценам лавки, если всё продать."""
+    by_grade = [0, 0, 0]
+    rows = {}          # (название, грейд) -> [штук, сумма]
+    no_price = {}      # (название, грейд) -> штук
+    counted = 0
+    sph = notes = signs = 0
+    with tiers_lock:
+        price_map = dict(prices)
+        sph_price = sphere_price[0]
+    for r in recs:
+        sph += r.get("s", 0)
+        notes += r.get("n", 0)
+        signs += r.get("z", 0)
+        items = r.get("i")
+        if items is None:
+            continue  # старая запись без названий: оценить ресурсы нельзя
+        counted += 1
+        for key, qty in items.items():
+            name, _, gr = key.rpartition("|")
+            gr = int(gr)
+            p = price_map.get(key)
+            if p is None:
+                no_price[(name, gr)] = no_price.get((name, gr), 0) + qty
+                continue
+            by_grade[gr] += p * qty
+            row = rows.setdefault((name, gr), [0, 0])
+            row[0] += qty
+            row[1] += p * qty
+    sph_sum = sph * sph_price
+    total = sum(by_grade) + sph_sum
+
+    lines = [f"Доход · {scope_title} · {period_title} · если всё продать", ""]
+    if not recs:
+        lines.append("Сборов пока нет.")
+        return "\n".join(lines)
+    lines += [f"💰 Всего: {fmt_money(total)}", ""]
+    for i in range(3):
+        lines.append(f"{GRADE_EMOJI[i]} {fmt_money(by_grade[i])}")
+    lines.append(f"📦 Сферы ×{sph}: {fmt_money(sph_sum)}")
+    top = sorted(rows.items(), key=lambda kv: -kv[1][1])[:5]
+    if top:
+        lines += ["", "Больше всего принесли:"]
+        for (name, gr), (qty, money) in top:
+            lines.append(f"{GRADE_EMOJI[gr]} {name.capitalize()} ×{qty}: {fmt_money(money)}")
+    extra = []
+    if notes:
+        extra.append(f"📜 Заметки: {notes}")
+    if signs:
+        extra.append(f"🎖 Знаки: {signs}")
+    if extra:
+        lines += ["", " · ".join(extra) + " (без цены)"]
+    if no_price:
+        lines += ["", f"❓ Нет цены: {sum(no_price.values())} шт."]
+        lines += [f"• {n.capitalize()} {'I' * (g + 1)} ×{q}" for (n, g), q in list(no_price.items())[:5]]
+    if counted < len(recs):
+        lines += ["", f"ℹ️ Ресурсы оценены по {counted} из {len(recs)} сборов (в старых записях нет названий)."]
+    return "\n".join(lines)
+
+
+def handle_income_command(peer_id, user_id, clean_text):
+    cmd = parse_stats_command(clean_text, INCOME_HEADS)
+    if cmd is None:
+        return False
+    if cmd["error"] or cmd["reset"]:
+        send_msg(peer_id, INCOME_USAGE)
+        return True
+    start, end, period_title = period_range(cmd["period"], time.time())
+    with stats_lock:
+        recs = list(stats.get(str(peer_id), []))
+    recs = [
+        r for r in recs
+        if r["t"] >= start and (end is None or r["t"] < end)
+        and (cmd["scope"] == "all" or r["u"] == user_id)
+    ]
+    scope_title = "Общая" if cmd["scope"] == "all" else "Моя"
+    send_msg(peer_id, format_income(recs, scope_title, period_title))
     return True
 
 
@@ -827,6 +1281,7 @@ HELP_USER = (
     "поставит таймер на босса и исследование и удалит ваше сообщение. "
     "Если приписать подпись или переслать вместе с логом начала сбора, сообщение останется.\n\n"
     "📊 /стата [общая] [сегодня | вчера | неделя | месяц | всё] — статистика сборов\n"
+    "💰 /доход [общая] [сегодня | вчера | неделя | месяц | всё] — сколько стоит добытое, если всё продать\n"
     "🏆 /топ — топ по ресурсам за неделю, /топ месяц, /топ всё (за всё время)\n"
     "⏳ /таймеры — ваши активные таймеры\n"
     "⏰ /таймер 45м кузница — свой таймер (45м, 1ч30м, 90)\n"
@@ -845,6 +1300,8 @@ HELP_ADMIN = (
     "➖ /удалить <аспект> — удалить одну руну\n"
     "🗑 /очистить — очистить базу рун\n"
     "🔐 /шифр+ <слово> — добавить слово в словарь шифра, /шифр- <слово> — убрать выученное\n"
+    "🧱 /тир — ресурсы без тира, /тир Название 3 — записать тир (списком: по строке на ресурс)\n"
+    "💰 /цены + список лавки — обновить цены, /цена Название II 9300 — одна цена, /цена сфера 13000\n"
     "📢 /все <текст> — рассылка во все рабочие чаты\n"
     "🧹 /стата сброс — очистить статистику этого чата\n"
     "🔎 /кто — перешлите сообщение с этой командой, бот покажет его from_id\n"
@@ -1198,6 +1655,7 @@ def process_game_forwards(msg, peer_id, user_id, fwd_messages):
                 "n": g["n"],
                 "z": g["z"],
                 "mt": g["mt"],
+                "i": g["items"],
             })
             continue
 
@@ -1881,11 +2339,17 @@ def handle_message(msg):
             return
         if handle_stats_command(peer_id, user_id, clean_text):
             return
+        if handle_income_command(peer_id, user_id, clean_text):
+            return
         if handle_top_command(peer_id, user_id, clean_text):
             return
         if handle_timer_commands(peer_id, user_id, clean_text, text):
             return
         if handle_cipher_command(peer_id, user_id, text):
+            return
+        if handle_tier_command(peer_id, user_id, text):
+            return
+        if handle_price_command(peer_id, user_id, text):
             return
         if handle_cipher_forward(msg, peer_id, user_id, fwd_messages):
             return
@@ -2239,6 +2703,8 @@ with data_lock:
 load_stats()
 load_timers()
 load_cipher_words()
+load_tiers()
+load_prices()
 
 
 def main():
