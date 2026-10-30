@@ -43,6 +43,14 @@ RUNES_PEER_IDS = [2000000011, 2000000013]  # Рабочие чаты сбора 
 # Чтобы слать только игрокам, оставьте тут один ID, например [2000000013]
 TOP_PEER_IDS = list(RUNES_PEER_IDS)
 
+# --- Напоминание про конец «Фракционной войны» (событие идёт неделю, с пятницы на субботу сбрасывается) ---
+WAR_REMINDER = True                    # False: напоминания выключены
+WAR_REMINDER_PEERS = list(RUNES_PEER_IDS)   # куда слать с тегом @all
+WAR_REMINDER_WEEKDAY = 4               # день недели: 0 — понедельник, 4 — пятница
+WAR_REMINDER_TIMES = ["18:00"]         # время по Москве. Первое — полное напоминание, остальные — короткие
+                                       # «последний звонок», например ["18:00", "22:00"]
+WAR_REMINDER_GRACE = 30 * 60           # если бот был выключен, ещё слать в течение этих секунд после времени
+
 # 5 аспектов рун Атраксиса
 ASPECTS = ["Мутация", "Стабильность", "Память", "Забвение", "Очищение"]
 
@@ -1300,6 +1308,7 @@ HELP_ADMIN = (
     "➖ /удалить <аспект> — удалить одну руну\n"
     "🗑 /очистить — очистить базу рун\n"
     "🔐 /шифр+ <слово> — добавить слово в словарь шифра, /шифр- <слово> — убрать выученное\n"
+    "⚔️ /война — показать напоминание про Фракционную войну (без тега)\n"
     "🧱 /тир — ресурсы без тира, /тир Название 3 — записать тир (списком: по строке на ресурс)\n"
     "💰 /цены + список лавки — обновить цены, /цена Название II 9300 — одна цена, /цена сфера 13000\n"
     "📢 /все <текст> — рассылка во все рабочие чаты\n"
@@ -1555,6 +1564,84 @@ def handle_timer_commands(peer_id, user_id, clean_text, text=None):
     return False
 
 
+# ==========================================
+# ⚔️ НАПОМИНАНИЕ: КОНЕЦ ФРАКЦИОННОЙ ВОЙНЫ
+# ==========================================
+WAR_TEXT = (
+    "@all ⚔️ ФРАКЦИОННАЯ ВОЙНА: ПОСЛЕДНИЙ ДЕНЬ!\n\n"
+    "Сегодня ночью, с пятницы на субботу, событие сбрасывается.\n"
+    "Успейте до конца дня:\n\n"
+    "🛒 выкупить нужные товары в магазине\n"
+    "🚩 разместить знамёна на локациях\n"
+    "💎 сдать кристалл накопления\n\n"
+    "Завтра уже новая неделя, так что не забудьте сделать всё сегодня ⏳"
+)
+WAR_TEXT_LAST = (
+    "@all ⏳ Фракционная война заканчивается совсем скоро!\n\n"
+    "Если ещё не выкупили товары, не разместили знамёна на локациях "
+    "и не сдали кристалл накопления, самое время."
+)
+
+
+def post_war_reminder(now=None):
+    """В пятницу в заданное время (по Москве) тегает всех в рабочих чатах. Что уже отправлено, помнит
+    в файле, поэтому перезапуск не даёт дублей."""
+    if not WAR_REMINDER:
+        return
+    now = time.time() if now is None else now
+    dt = datetime.fromtimestamp(now, MSK)
+    if dt.weekday() != WAR_REMINDER_WEEKDAY:
+        return
+    for i, hm in enumerate(WAR_REMINDER_TIMES):
+        try:
+            h, m = (int(x) for x in hm.split(":"))
+            slot_dt = dt.replace(hour=h, minute=m, second=0, microsecond=0)
+        except ValueError:
+            continue
+        if not 0 <= now - slot_dt.timestamp() <= WAR_REMINDER_GRACE:
+            continue
+        slot = slot_dt.strftime("%Y-%m-%d %H:%M")
+        with stats_lock:
+            if slot in posted.get("war", []):
+                continue
+        retry_at = _post_state.get("war " + slot)
+        if retry_at and now < retry_at:
+            continue
+        text = WAR_TEXT if i == 0 else WAR_TEXT_LAST
+        sent_any = False
+        for pid in WAR_REMINDER_PEERS:
+            if send_msg(pid, text):
+                sent_any = True
+        if sent_any or not WAR_REMINDER_PEERS:
+            with stats_lock:
+                done = posted.setdefault("war", [])
+                done.append(slot)
+                del done[:-10]
+                save_stats()
+            _post_state.pop("war " + slot, None)
+            print(f"⚔️ Напоминание про Фракционную войну отправлено ({slot})")
+        else:
+            _post_state["war " + slot] = now + 60
+
+
+def handle_war_command(peer_id, user_id, clean_text):
+    """/война (админ): показать текст напоминания в этом чате, без тега."""
+    if clean_text.strip() not in ("/война", "/war"):
+        return False
+    if user_id != ADMIN_ID:
+        send_msg(peer_id, "⛔ У вас нет доступа к этой команде.")
+        return True
+    when = ", ".join(WAR_REMINDER_TIMES) or "не задано"
+    send_msg(
+        peer_id,
+        "👀 Так будет выглядеть напоминание (без тега, это просмотр):\n\n"
+        + WAR_TEXT.replace("@all ", "", 1)
+        + f"\n\nОтправка: по пятницам в {when} (МСК)."
+        + ("" if WAR_REMINDER else "\n⚠️ Сейчас оно выключено (WAR_REMINDER = False)."),
+    )
+    return True
+
+
 def scheduler_tick(now=None):
     """Один проход планировщика: срабатывают таймеры и удаляются старые сообщения бота."""
     now = time.time() if now is None else now
@@ -1605,6 +1692,12 @@ def scheduler_tick(now=None):
         post_period_tops(now)
     except Exception:
         print("⚠️ Ошибка публикации итогов:")
+        traceback.print_exc()
+
+    try:
+        post_war_reminder(now)
+    except Exception:
+        print("⚠️ Ошибка напоминания про Фракционную войну:")
         traceback.print_exc()
 
 
@@ -2348,6 +2441,8 @@ def handle_message(msg):
         if handle_cipher_command(peer_id, user_id, text):
             return
         if handle_tier_command(peer_id, user_id, text):
+            return
+        if handle_war_command(peer_id, user_id, clean_text):
             return
         if handle_price_command(peer_id, user_id, text):
             return
