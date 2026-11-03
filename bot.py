@@ -77,6 +77,9 @@ CUSTOM_MAX = 24 * 3600    # свой таймер: максимум 24 часа
 CUSTOM_LIMIT = 5          # не больше 5 своих таймеров на игрока в чате
 
 # --- Шифр Цезаря (терминал ИИ Авроры приходит в личку с Атраксисом) ---
+TOKEN_STATS = True        # пересланный «Жетон»: бот пишет, сколько родных статов добавилось с прошлого раза
+TOKEN_TTL = 5 * 60        # через сколько секунд удалять ответ бота и пересланный жетон (None: не удалять жетон)
+TOKEN_CAP_PER_LEVEL = 20  # кап родных статов = уровень × 20
 CIPHER_FORWARD = True     # игроки пересылают терминал в рабочий чат, бот отвечает расшифровкой
 CIPHER_TTL = 60           # через сколько секунд удалять и ответ бота, и пересланный терминал
 CIPHER_AUTO = False       # решать шифр сам, когда терминал приходит в личку аккаунту бота
@@ -86,6 +89,7 @@ CIPHER_DELAY = (2, 4)     # пауза перед ответом в игру, с
 CIPHER_NOTIFY_ID = ADMIN_ID   # кому писать, когда бот не уверен или игра сказала «неверно»
 CIPHER_WORDS_FILE = os.path.join(DATA_DIR, "cipher_words.json")  # слова, которые бот выучил сам
 TIERS_FILE = os.path.join(DATA_DIR, "resource_tiers.json")        # тир каждого ресурса по названию
+TOKEN_FILE = os.path.join(DATA_DIR, "token_stats.json")           # последний жетон каждого игрока (рост статов)
 PRICES_FILE = os.path.join(DATA_DIR, "prices.json")               # цены, обновлённые командами /цены и /цена
 
 # Московское время (без перехода на летнее/зимнее)
@@ -1294,6 +1298,7 @@ HELP_USER = (
     "⏳ /таймеры — ваши активные таймеры\n"
     "⏰ /таймер 45м кузница — свой таймер (45м, 1ч30м, 90)\n"
     "🗑 /отмена [босс | исследование | свои] — отменить таймеры\n"
+    "🧬 Жетон («Показать жетон») перешлите сюда: бот напишет, сколько родных статов добавилось с прошлого раза и сколько осталось до капа\n"
     "🔐 Терминал с шифром просто перешлите сюда: бот пришлёт ответ и через минуту всё удалит\n"
     "📜 /статус — сколько рун собрано\n"
     "🏓 /пинг — проверить, что бот жив"
@@ -2369,6 +2374,132 @@ def handle_cipher_command(peer_id, user_id, text):
 
 
 # ==========================================
+# 🧬 ЖЕТОН: РОСТ РОДНЫХ СТАТОВ
+# ==========================================
+# Игрок пересылает «Жетон». Бот берёт ТОЛЬКО цифры в скобках (родные статы без брони): ХП, интеллект, сила,
+# ловкость. Первый жетон просто запоминается, следующие сравниваются с предыдущим. Кап = уровень × 20.
+TOKEN_STATS_DEF = [
+    ("hp", "❤️", "ХП"),
+    ("int", "🧠", "Интеллект"),
+    ("str", "💪", "Сила"),
+    ("dex", "🖐", "Ловкость"),
+]
+TOKEN_EMOJI = {"❤": "hp", "🧠": "int", "💪": "str", "🖐": "dex", "✋": "dex", "🤚": "dex"}
+RE_TOKEN_STAT = re.compile(r"([^\s\w:|()]+)\s*:\s*(\d+)\s*\(\s*(\d+)\s*\)")
+RE_TOKEN_LEVEL = re.compile(r"Уровень\s*:\s*(\d+)", re.I)
+RE_TOKEN_NAME = re.compile(r"Жетон[ \t]+([^\n]+)", re.I)
+RU_MONTHS_SHORT = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+
+token_lock = threading.Lock()
+token_data = {}   # ключ игрока -> {"name", "t", "lvl", "s": {hp,int,str,dex}}
+
+
+def load_tokens():
+    raw = _load_json(TOKEN_FILE, {})
+    with token_lock:
+        token_data.clear()
+        token_data.update(raw.get("users", {}))
+
+
+def save_tokens():
+    _save_json(TOKEN_FILE, {"users": token_data})
+
+
+def parse_token(text):
+    """Разбирает жетон. Возвращает {"name", "lvl", "s"} или None, если это не жетон."""
+    if not text or "жетон" not in text.lower():
+        return None
+    lm = RE_TOKEN_LEVEL.search(text)
+    if not lm:
+        return None
+    pairs = []
+    for m in RE_TOKEN_STAT.finditer(text):
+        sym = m.group(1).replace("️", "")
+        pairs.append((sym, int(m.group(3))))  # берём число в скобках
+    stats_map = {}
+    for sym, val in pairs:
+        key = TOKEN_EMOJI.get(sym)
+        if key and key not in stats_map:
+            stats_map[key] = val
+    if len(stats_map) < 4:
+        # смайлики незнакомые: в жетоне порядок всегда ХП, интеллект, сила, ловкость
+        if len(pairs) < 4:
+            return None
+        stats_map = {k: pairs[i][1] for i, (k, _, _) in enumerate(TOKEN_STATS_DEF)}
+    nm = RE_TOKEN_NAME.search(text)
+    name = re.sub(r"\s+", " ", nm.group(1)).strip() if nm else ""
+    return {"name": name, "lvl": int(lm.group(1)), "s": stats_map}
+
+
+def token_dt(ts):
+    d = datetime.fromtimestamp(ts, MSK)
+    return f"{d.day} {RU_MONTHS_SHORT[d.month - 1]}, {d:%H:%M}"
+
+
+def format_token_report(who, new, old, fdate):
+    cap = new["lvl"] * TOKEN_CAP_PER_LEVEL
+    total = sum(new["s"].values())
+    left = max(0, cap - total)
+    tail = (
+        f"🎯 Всего {total} из {cap} (ур. {new['lvl']})\n"
+        + ("🏁 Кап достигнут!" if left == 0 else f"⏳ До капа осталось {left}")
+    )
+    if old is None:
+        lines = [f"🧬 {who}, жетон записан: с него начнём считать рост родных статов"]
+        for key, emo, label in TOKEN_STATS_DEF:
+            lines.append(f"{emo} {label}: {new['s'][key]}")
+        lines.append(tail)
+        return "\n".join(lines)
+
+    lines = [f"🧬 {who}, с {token_dt(old['t'])} по {token_dt(fdate)}"]
+    if new["lvl"] != old["lvl"]:
+        lines.append(f"⭐ Уровень {old['lvl']} → {new['lvl']}")
+    gained = 0
+    changed = False
+    for key, emo, label in TOKEN_STATS_DEF:
+        d = new["s"][key] - old["s"].get(key, new["s"][key])
+        if d:
+            changed = True
+            gained += d
+            lines.append(f"{emo} {label} {d:+d}")
+    if not changed:
+        lines.append("Родные статы не менялись.")
+    else:
+        lines.append(f"📈 Всего {gained:+d}")
+    lines.append(tail)
+    return "\n".join(lines)
+
+
+def handle_token_forward(msg, peer_id, user_id, fwd_messages):
+    """Рабочий чат: переслан жетон. Пишем, сколько родных статов добавилось с прошлого жетона."""
+    if not TOKEN_STATS:
+        return False
+    found = False
+    for fwd in fwd_messages:
+        if fwd.get("from_id") not in (ATRAXIS_ID, AURORA_ID):
+            continue
+        tok = parse_token(fwd.get("text") or "")
+        if not tok:
+            continue
+        found = True
+        fdate = int(fwd.get("date") or time.time())
+        key = (tok["name"] or f"id{user_id}").lower()
+        who = tok["name"] or get_name(user_id)
+        with token_lock:
+            old = token_data.get(key)
+            if old and fdate <= old["t"]:
+                text = f"ℹ️ {who}, этот жетон не новее записанного ({token_dt(old['t'])}), пропускаю."
+            else:
+                text = format_token_report(who, tok, old, fdate)
+                token_data[key] = {"name": tok["name"], "t": fdate, "lvl": tok["lvl"], "s": tok["s"]}
+                save_tokens()
+        schedule_delete(send_msg(peer_id, text), TOKEN_TTL)
+    if found and TOKEN_TTL:
+        schedule_delete(msg.get("id"), TOKEN_TTL)
+    return found
+
+
+# ==========================================
 # 📨 ОБРАБОТКА ОДНОГО СООБЩЕНИЯ
 # ==========================================
 def handle_message(msg):
@@ -2447,6 +2578,8 @@ def handle_message(msg):
         if handle_price_command(peer_id, user_id, text):
             return
         if handle_cipher_forward(msg, peer_id, user_id, fwd_messages):
+            return
+        if handle_token_forward(msg, peer_id, user_id, fwd_messages):
             return
 
     # ----------------------------------------------------
@@ -2800,6 +2933,7 @@ load_timers()
 load_cipher_words()
 load_tiers()
 load_prices()
+load_tokens()
 
 
 def main():
