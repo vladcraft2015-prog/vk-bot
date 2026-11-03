@@ -78,7 +78,8 @@ CUSTOM_LIMIT = 5          # не больше 5 своих таймеров на
 
 # --- Шифр Цезаря (терминал ИИ Авроры приходит в личку с Атраксисом) ---
 TOKEN_STATS = True        # пересланный «Жетон»: бот пишет, сколько родных статов добавилось с прошлого раза
-TOKEN_TTL = 5 * 60        # через сколько секунд удалять ответ бота и пересланный жетон (None: не удалять жетон)
+TOKEN_TTL = None          # None: ничего не удалять. Число секунд: удалять ответ бота, жетон и «Показать жетон» (нужны права админа)
+TOKEN_LIVE_PEERS = list(RUNES_PEER_IDS)   # чаты, где бот отвечает на жетон, выданный игрой прямо там (без пересылки)
 TOKEN_CAP_PER_LEVEL = 20  # кап родных статов = уровень × 20
 CIPHER_FORWARD = True     # игроки пересылают терминал в рабочий чат, бот отвечает расшифровкой
 CIPHER_TTL = 60           # через сколько секунд удалять и ответ бота, и пересланный терминал
@@ -1298,7 +1299,7 @@ HELP_USER = (
     "⏳ /таймеры — ваши активные таймеры\n"
     "⏰ /таймер 45м кузница — свой таймер (45м, 1ч30м, 90)\n"
     "🗑 /отмена [босс | исследование | свои] — отменить таймеры\n"
-    "🧬 Жетон («Показать жетон») перешлите сюда: бот напишет, сколько родных статов добавилось с прошлого раза и сколько осталось до капа\n"
+    "🧬 Жетон: бот сам ответит на выданный в чате (или на пересланный), напишет, сколько родных статов добавилось с прошлого раза и сколько осталось до капа\n"
     "🔐 Терминал с шифром просто перешлите сюда: бот пришлёт ответ и через минуту всё удалит\n"
     "📜 /статус — сколько рун собрано\n"
     "🏓 /пинг — проверить, что бот жив"
@@ -2470,7 +2471,23 @@ def format_token_report(who, new, old, fdate):
     return "\n".join(lines)
 
 
-def handle_token_forward(msg, peer_id, user_id, fwd_messages):
+def find_token_requests(peer_id, before_ts):
+    """Сообщения «Показать жетон», отправленные незадолго до выдачи жетона (свои и чужие)."""
+    try:
+        with api_lock:
+            items = vk.messages.getHistory(peer_id=peer_id, count=10).get("items", [])
+    except Exception as e:
+        print(f"⚠️ Не удалось прочитать историю {peer_id}: {e}")
+        return []
+    ids = []
+    for m in items:
+        t = (m.get("text") or "").strip().lower()
+        if t == "показать жетон" and before_ts - 180 <= int(m.get("date") or 0) <= before_ts + 5:
+            ids.append(m.get("id"))
+    return ids
+
+
+def handle_token_forward(msg, peer_id, user_id, fwd_messages, live=False):
     """Рабочий чат: переслан жетон. Пишем, сколько родных статов добавилось с прошлого жетона."""
     if not TOKEN_STATS:
         return False
@@ -2493,9 +2510,14 @@ def handle_token_forward(msg, peer_id, user_id, fwd_messages):
                 text = format_token_report(who, tok, old, fdate)
                 token_data[key] = {"name": tok["name"], "t": fdate, "lvl": tok["lvl"], "s": tok["s"]}
                 save_tokens()
-        schedule_delete(send_msg(peer_id, text), TOKEN_TTL)
+        mid = send_msg(peer_id, text)
+        if TOKEN_TTL:
+            schedule_delete(mid, TOKEN_TTL)
     if found and TOKEN_TTL:
-        schedule_delete(msg.get("id"), TOKEN_TTL)
+        schedule_delete(msg.get("id"), TOKEN_TTL)  # пересланный жетон или сам жетон от Авроры
+        if live:
+            for rid in find_token_requests(peer_id, int(msg.get("date") or time.time())):
+                schedule_delete(rid, TOKEN_TTL)      # «Показать жетон»
     return found
 
 
@@ -2517,6 +2539,12 @@ def handle_message(msg):
         fwd_messages.append(msg["reply_message"])
 
     clean_text = text.lower()
+
+    # Жетон, выданный Авророй прямо в этом чате: отвечаем, а через TOKEN_TTL убираем всё (запрос, жетон, ответ)
+    if TOKEN_STATS and peer_id in TOKEN_LIVE_PEERS and user_id in (AURORA_ID, ATRAXIS_ID):
+        live = [{"from_id": user_id, "text": text, "date": msg.get("date")}]
+        if handle_token_forward(msg, peer_id, user_id, live, live=True):
+            return
 
     # «дел» ответом на сообщение (только админ): удалить его и саму команду
     if handle_delete_command(msg, peer_id, user_id, clean_text):
