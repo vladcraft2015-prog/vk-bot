@@ -310,9 +310,65 @@ def get_status_text(runes):
     return f"📊 Статус рун ({len(runes)}/5):\n\n" + "\n".join(status_lines)
 
 
+# ==========================================
+# 🗺 КАРТА: РЕГИОН И ГОРОД ПО КООРДИНАТАМ
+# ==========================================
+# Карта мира Atraxis: север (вверх) Мортем, юг Люменор, восток (вправо) Тэнебрис, запад Хром-Гарн.
+# Границы идут примерно по диагоналям, но неровно, поэтому сначала смотрим точный список из
+# проверенных клеток, а для остальных считаем по диагонали и у границы честно пишем, что это приблизительно.
+REGION_INSTR = {"Мортем": "Мортемом", "Люменор": "Люменором", "Тэнебрис": "Тэнебрисом", "Хром-Гарн": "Хром-Гарном"}
+KNOWN_REGION_CELLS = {
+    "Мортем": [(6, 6), (-6, 6), (7, 7), (-8, 8), (-11, 11), (-12, 11)],
+    "Тэнебрис": [(7, 6), (10, 9), (10, -9)],
+    "Люменор": [(6, -6), (-6, -6), (7, -7), (-8, -8), (-9, -9), (11, -10), (-11, -10), (12, -12), (-12, -12)],
+    "Хром-Гарн": [(-9, 7), (-9, -8), (-11, 9), (-11, -9), (-13, -10)],
+}
+KNOWN_CELL_REGION = {c: r for r, cells in KNOWN_REGION_CELLS.items() for c in cells}
+# Города занимают по четыре клетки вокруг центра (нуля в координатах нет: после -1 идёт 1)
+CITY_CELLS = {
+    "Мортем": [(x, y) for x in (-1, 1) for y in (8, 9)],
+    "Люменор": [(x, y) for x in (-1, 1) for y in (-8, -9)],
+    "Хром-Гарн": [(x, y) for x in (-9, -8) for y in (-1, 1)],
+    "Тэнебрис": [(x, y) for x in (8, 9) for y in (-1, 1)],
+}
+CITY_CELL_NAME = {c: r for r, cells in CITY_CELLS.items() for c in cells}
+BORDER_BAND = 2  # если |x| и |y| различаются не больше, чем на столько, клетка у границы регионов
+
+
+def region_by_diagonal(x, y):
+    """Регион по диагоналям и соседний регион, с которым граница рядом."""
+    if abs(y) >= abs(x):
+        main = "Мортем" if y > 0 else "Люменор"
+        side = "Тэнебрис" if x > 0 else "Хром-Гарн"
+    else:
+        main = "Тэнебрис" if x > 0 else "Хром-Гарн"
+        side = "Мортем" if y > 0 else "Люменор"
+    return main, side
+
+
+def describe_place(coords):
+    """Строка про регион и город по координатам вида «8:4». Пустая строка, если не разобрали."""
+    m = re.fullmatch(r"\s*(-?\d+)\s*:\s*(-?\d+)\s*", coords or "")
+    if not m:
+        return ""
+    x, y = int(m.group(1)), int(m.group(2))
+    if x == 0 or y == 0:
+        return ""
+    city = CITY_CELL_NAME.get((x, y))
+    if city:
+        return f"🏙 В черте города {city}"
+    known = KNOWN_CELL_REGION.get((x, y))
+    if known:
+        return f"🌍 Регион: {known}"
+    main, side = region_by_diagonal(x, y)
+    if abs(abs(x) - abs(y)) <= BORDER_BAND:
+        return f"🌍 Регион: {main} (у границы с {REGION_INSTR[side]})"
+    return f"🌍 Регион: {main}"
+
+
 def broadcast_notification():
     message = (
-        "@all 🏛 **Алтарь готов к ритуалу!** (Собрано 5/5)\n\n"
+        "@all 🏛 Алтарь готов к ритуалу! (Собрано 5/5)\n\n"
         "Найди алтарь в игре и перешли сюда системное сообщение:\n"
         "«✍ Введите все 5 руноблоков через пробел. Порядок не важен. Есть лишь один шанс...»\n\n"
         "Бот мгновенно выдаст тебе все руноблоки 📜"
@@ -2558,7 +2614,7 @@ def handle_message(msg):
     # 1. ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ В БЕСЕДАХ
     # ----------------------------------------------------
     if clean_text in ["/id", "/чат", "/chat"]:
-        send_msg(peer_id, f"🆔 **ID этого чата:** `{peer_id}`")
+        send_msg(peer_id, f"🆔 ID этого чата: {peer_id}")
         return
 
     if clean_text in [
@@ -2581,7 +2637,7 @@ def handle_message(msg):
 
         send_msg(
             peer_id,
-            f"🏓 **ПОНГ!** Юзербот работает стабильно.\n⏱ **Время онлайн:** {uptime_str}",
+            f"🏓 ПОНГ! Юзербот работает стабильно.\n⏱ Время онлайн: {uptime_str}",
         )
         return
 
@@ -2636,17 +2692,17 @@ def handle_message(msg):
                         code_val = val.get("code", "???") if isinstance(val, dict) else str(val)
                         t_val = val.get("time", 0) if isinstance(val, dict) else 0
                         t_str = time.strftime("%H:%M", time.localtime(t_val)) if t_val else "время не указано"
-                        lines.append(f"• {a}: `{code_val}` (в {t_str})")
+                        lines.append(f"• {a}: {code_val} (в {t_str})")
                     else:
                         lines.append(f"• {a}: *нет*")
-            msg_text = "💾 **Все собранные коды (Админ):**\n\n" + "\n".join(lines)
+            msg_text = "💾 Все собранные коды (Админ):\n\n" + "\n".join(lines)
             send_msg(peer_id, msg_text)
             return
 
         if clean_text.startswith("/все"):
             broadcast_text = text[4:].strip()
             if broadcast_text:
-                send_to_work_chats(f"📢 **Общее сообщение:**\n\n{broadcast_text}")
+                send_to_work_chats(f"📢 Общее сообщение:\n\n{broadcast_text}")
                 send_msg(peer_id, "✅ Сообщение отправлено во все рабочие чаты.")
             else:
                 send_msg(peer_id, "⚠️ Формат команды: /все <текст рассылки>")
@@ -2800,7 +2856,7 @@ def handle_message(msg):
                 save_data(runes)
 
             response = (
-                f"🚨 **Алтарь вскрыт! ({reset_time_str})**\n\n"
+                f"🚨 Алтарь вскрыт! ({reset_time_str})\n\n"
                 f"• База рун полностью очищена (удалено: {old_count})."
             )
             send_to_work_chats(response)
@@ -2824,11 +2880,14 @@ def handle_message(msg):
                 coords = coords_match.group(1).strip()
 
                 colossus_msg = (
-                    f"@online ☄️ **ОБНАРУЖЕНА УГРОЗА!**\n"
+                    f"@online ☄️ ОБНАРУЖЕНА УГРОЗА!\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"👹 **Существо:** {boss_name}\n"
-                    f"📍 **Координаты:** `{coords}`"
+                    f"👹 Существо: {boss_name}\n"
+                    f"📍 Координаты: {coords}"
                 )
+                place = describe_place(coords)
+                if place:
+                    colossus_msg += f"\n{place}"
                 send_to_work_chats(colossus_msg)
 
         # Босс на стене (@all)
@@ -2842,7 +2901,7 @@ def handle_message(msg):
             and "заверш" not in clean_text
         ):
             event_msg = (
-                f"@all 🛑 **БОЛЬШОЙ БОСС НА СТЕНЕ!**\n"
+                f"@all 🛑 БОЛЬШОЙ БОСС НА СТЕНЕ!\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"👾 В группе пробудился мировой босс!\n"
                 f"⚔️ Переходите к посту на стене и вступайте в бой."
@@ -2856,7 +2915,7 @@ def handle_message(msg):
             and "изучены" not in clean_text
         ):
             event_msg = (
-                f"@all 🧪 **НОВОЕ СОБЫТИЕ НА СТЕНЕ!**\n"
+                f"@all 🧪 НОВОЕ СОБЫТИЕ НА СТЕНЕ!\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"🔬 На стене группы появилось аномальное событие.\n"
                 f"🚀 Пора отправляться на исследование!"
@@ -2873,7 +2932,7 @@ def handle_message(msg):
             and "завершен" not in clean_text
         ):
             event_msg = (
-                f"@all 🏟 **ТУРНИР НА АРЕНЕ!**\n"
+                f"@all 🏟 ТУРНИР НА АРЕНЕ!\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"⚔️ Через 30 минут начинается турнир на арене Хром-Гарна!"
             )
