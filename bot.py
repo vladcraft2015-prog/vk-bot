@@ -78,6 +78,8 @@ CUSTOM_LIMIT = 5          # не больше 5 своих таймеров на
 
 # --- Шифр Цезаря (терминал ИИ Авроры приходит в личку с Атраксисом) ---
 TOKEN_STATS = True        # пересланный «Жетон»: бот пишет, сколько родных статов добавилось с прошлого раза
+ALTAR_SHARE_PCT = 10        # сколько процентов стоимости наград за каждую внесённую руну
+REWARD_PRICES_FILE = os.path.join(DATA_DIR, "reward_prices.json")  # цены наград алтаря (фреймы), правятся командой /награда
 TOKEN_TTL = None          # None: ничего не удалять. Число секунд: удалять ответ бота, жетон и «Показать жетон» (нужны права админа)
 TOKEN_LIVE_PEERS = list(RUNES_PEER_IDS)   # чаты, где бот отвечает на жетон, выданный игрой прямо там (без пересылки)
 TOKEN_CAP_PER_LEVEL = 20  # кап родных статов = уровень × 20
@@ -91,6 +93,7 @@ CIPHER_NOTIFY_ID = ADMIN_ID   # кому писать, когда бот не у
 CIPHER_WORDS_FILE = os.path.join(DATA_DIR, "cipher_words.json")  # слова, которые бот выучил сам
 TIERS_FILE = os.path.join(DATA_DIR, "resource_tiers.json")        # тир каждого ресурса по названию
 TOKEN_FILE = os.path.join(DATA_DIR, "token_stats.json")           # последний жетон каждого игрока (рост статов)
+ALTAR_FILE = os.path.join(DATA_DIR, "altar_last.json")             # кто вносил руны в прошлый алтарь
 PRICES_FILE = os.path.join(DATA_DIR, "prices.json")               # цены, обновлённые командами /цены и /цена
 
 # Московское время (без перехода на летнее/зимнее)
@@ -305,9 +308,270 @@ def get_name(user_id):
     return name
 
 
+def rune_owner(value):
+    """Кто первым внёс руну (id) или None, если неизвестно (старые записи)."""
+    return value.get("u") if isinstance(value, dict) else None
+
+
 def get_status_text(runes):
-    status_lines = [f"• {a}: {'+' if a in runes else '-'}" for a in ASPECTS]
+    status_lines = []
+    for a in ASPECTS:
+        if a not in runes:
+            status_lines.append(f"• {a}: -")
+            continue
+        owner = rune_owner(runes[a])
+        status_lines.append(f"• {a}: + ({get_full_name(owner)})" if owner else f"• {a}: +")
     return f"📊 Статус рун ({len(runes)}/5):\n\n" + "\n".join(status_lines)
+
+
+def store_rune(aspect, code, when, user_id):
+    """Записывает руну. Код и время обновляются, как раньше, а авторство остаётся у ПЕРВОГО, кто внёс
+    эту руну в текущий алтарь. Вызывать под data_lock. Возвращает (id первого, была ли руна уже)."""
+    prev = runes.get(aspect)
+    was_present = prev is not None
+    first_u = rune_owner(prev) or user_id
+    first_t = (prev.get("ut") if isinstance(prev, dict) else None) or when
+    runes[aspect] = {"code": code, "time": when, "u": first_u, "ut": first_t}
+    return first_u, was_present
+
+
+altar_last = {}  # что было в алтаре на момент вскрытия: {"time": ..., "runes": {аспект: {"u": id, "code": ...}}}
+
+
+def load_altar():
+    raw = _load_json(ALTAR_FILE, {})
+    if isinstance(raw, dict):
+        altar_last.clear()
+        altar_last.update(raw)
+
+
+def snapshot_altar():
+    """Запоминает вкладчиков перед очисткой базы рун при вскрытии алтаря. Вызывать под data_lock."""
+    if not runes:
+        return  # пустая база: не затираем прежний архив случайным срабатыванием
+    snap = {}
+    for a, v in runes.items():
+        snap[a] = {"u": rune_owner(v), "code": v.get("code") if isinstance(v, dict) else str(v)}
+    altar_last.clear()
+    altar_last.update({"time": time.time(), "runes": snap})
+    _save_json(ALTAR_FILE, dict(altar_last))
+
+
+def contributors_text(title, runes_map, opened_at=None):
+    """Красивый список «кто какую руну внёс» и сколько это рун у каждого."""
+    lines = [title]
+    if opened_at:
+        lines[0] += " · вскрыт " + time.strftime("%d.%m в %H:%M", time.localtime(opened_at))
+    lines.append("")
+    per_user = {}
+    for a in ASPECTS:
+        v = runes_map.get(a)
+        if v is None:
+            lines.append(f"▫️ {a}: нет")
+            continue
+        owner = rune_owner(v)
+        if owner:
+            per_user[owner] = per_user.get(owner, 0) + 1
+            lines.append(f"🔮 {a}: {get_full_name(owner)}")
+        else:
+            lines.append(f"🔮 {a}: неизвестно")
+    if per_user:
+        lines += ["", "Вложили:"]
+        for u, n in sorted(per_user.items(), key=lambda kv: -kv[1]):
+            lines.append(f"• {get_full_name(u)}: {n} из {len(ASPECTS)}")
+    return "\n".join(lines)
+
+
+# ==========================================
+# 💸 ВСКРЫТИЕ АЛТАРЯ: НАГРАДЫ И ВЫПЛАТЫ ЗА РУНЫ
+# ==========================================
+# Игрок пересылает в рабочий чат лог «Ритуал завершён. Алтарь утихает.» от Атраксиса. Бот находит в нём
+# награды, оценивает ценные (фреймы) по цене покупки из магазина, округляет и делит: каждому, кто внёс
+# руну, по ALTAR_SHARE_PCT % стоимости за каждую внесённую им руну.
+REWARD_PRICES_SEED = {
+    "фрейм познания": 186269,
+    "фрейм усиления": 178123,
+    "фрейм инкрустации": 973098,
+    "фрейм пробуждения": 2190789,
+    "фрейм изменчивости": 171000,
+}
+reward_prices = dict(REWARD_PRICES_SEED)
+reward_lock = threading.Lock()
+
+
+def norm_item(name):
+    """Название предмета для сравнения: русские слова, строчные, «ё» как «е»."""
+    return " ".join(re.findall(r"[а-я]{2,}", name.lower().replace("ё", "е")))
+
+
+def load_reward_prices():
+    raw = _load_json(REWARD_PRICES_FILE, {})
+    with reward_lock:
+        reward_prices.update({k: int(v) for k, v in raw.get("prices", {}).items()})
+
+
+def _save_reward_prices():
+    _save_json(REWARD_PRICES_FILE, {"prices": reward_prices})
+
+
+def money_round(n):
+    """Округление «чтобы не было страшных цифр»: до тысяч, а мелкие суммы до сотен."""
+    step = 1000 if n >= 10000 else 100
+    return int(round(n / step)) * step
+
+
+def money_fmt(n):
+    return f"{int(n):,}".replace(",", "\u00a0")
+
+
+def parse_altar_log(text):
+    """Награды из лога ритуала: опыт и список предметов (название, грейд 0/1/2, штук)."""
+    text = RE_QTY_ALONE.sub(r" \1", text)
+    exp = None
+    items = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        m = re.search(r"опыт\s*\+?\s*([\d.,]+)\s*%", line, re.I)
+        if m:
+            exp = m.group(1).replace(".", ",")
+            continue
+        if "{" not in line:
+            continue
+        qty = 1
+        qm = RE_QTY.search(line)
+        if qm:
+            qty = max(1, int(qm.group(1)))
+            line = line[: qm.start()].strip()
+        grade = 0 if "⚪" in line else 1 if "🔵" in line else 2 if "🟣" in line else None
+        key = norm_item(re.sub(r"\{[^}]*\}", " ", line))
+        if not key:
+            continue
+        items[(key, grade)] = items.get((key, grade), 0) + qty
+    return {"exp": exp, "items": [(k, g, q) for (k, g), q in items.items()]}
+
+
+def pick_altar_contributors(log_date):
+    """Кто вносил руны: архив при вскрытии (если он рядом по времени с логом), иначе текущая база."""
+    with data_lock:
+        last = dict(altar_last)
+        cur = dict(runes)
+    snap_t = last.get("time") or 0
+    if last.get("runes") and abs(snap_t - log_date) <= 3 * 3600:
+        return last["runes"], ""
+    if cur:
+        return cur, "Аврора ещё не сообщила о вскрытии, поэтому взял руны, которые сейчас в базе."
+    if last.get("runes"):
+        return last["runes"], "⚠️ Список вкладчиков может быть от другого алтаря: слишком давно."
+    return {}, ""
+
+
+def build_altar_report(parsed, opener, contributors, note=""):
+    with reward_lock:
+        prices_map = dict(reward_prices)
+    valued, unpriced = [], []
+    total = 0
+    for key, grade, qty in parsed["items"]:
+        price = prices_map.get(key)
+        if price is None:
+            if grade == 2 or key.startswith("фрейм"):
+                unpriced.append((key, qty))
+            continue
+        valued.append((key, grade, qty, price))
+        total += price * qty
+
+    lines = ["🏛 АЛТАРЬ ВСКРЫТ", "━━━━━━━━━━━━━━━━━━", f"👤 Вскрыл: {get_full_name(opener)}"]
+    if parsed["exp"]:
+        lines.append(f"✨ Опыт: +{parsed['exp']}%")
+
+    if valued:
+        lines += ["", "🏺 Ценные награды:"]
+        for key, grade, qty, price in sorted(valued, key=lambda v: -v[3] * v[2]):
+            mult = f" ×{qty}" if qty > 1 else ""
+            lines.append(f"{GRADE_EMOJI.get(grade, '▫️')} {key.capitalize()}{mult}: {money_fmt(money_round(price * qty))}")
+        lines += ["━━━━━━━━━━━━━━━━━━", f"💰 Стоимость: ≈ {money_fmt(money_round(total))}"]
+    else:
+        lines += ["", "Среди наград нет предметов с известной ценой, считать нечего."]
+
+    if unpriced:
+        names = ", ".join(f"{k.capitalize()}" + (f" ×{q}" if q > 1 else "") for k, q in unpriced)
+        lines += ["", f"❓ Нет цены: {names}", "Добавить: /награда Название цена"]
+
+    if valued:
+        per_user = {}
+        for a in ASPECTS:
+            owner = rune_owner(contributors.get(a)) if a in contributors else None
+            if owner:
+                per_user[owner] = per_user.get(owner, 0) + 1
+        orphan = len(ASPECTS) - sum(per_user.values())
+        lines += ["", f"💸 Выплаты за руны (по {ALTAR_SHARE_PCT}% за каждую):"]
+        if not per_user:
+            lines.append("Не знаю, кто вносил руны: в базе нет данных об авторах.")
+        to_pay = 0
+        for u, n in sorted(per_user.items(), key=lambda kv: -kv[1]):
+            pct = ALTAR_SHARE_PCT * n
+            amount = money_round(total * pct / 100)
+            runes_word = "руна" if n == 1 else "руны" if n < 5 else "рун"
+            if u == opener:
+                lines.append(f"🔮 {get_full_name(u)} (вскрыл): {n} {runes_word}, {pct}%, себе")
+            else:
+                to_pay += amount
+                lines.append(f"🔮 {get_full_name(u)}: {n} {runes_word}, {pct}%, {money_fmt(amount)}")
+        if per_user:
+            lines += ["━━━━━━━━━━━━━━━━━━", f"📤 К выплате: {money_fmt(to_pay)}"]
+        if orphan > 0 and per_user:
+            lines.append(f"❔ Без автора рун: {orphan}")
+    if note:
+        lines += ["", note]
+    lines += ["", "Цены: по первому ценнику (покупка) из магазина, округлено."]
+    return "\n".join(lines)
+
+
+def handle_altar_log(msg, peer_id, user_id, fwd_messages):
+    """Игрок переслал лог вскрытия алтаря от Атраксиса: считаем награды и выплаты."""
+    for fwd in fwd_messages:
+        if fwd.get("from_id") != ATRAXIS_ID:
+            continue
+        ftext = fwd.get("text") or ""
+        low = ftext.lower()
+        if "ритуал заверш" not in low or "алтарь утихает" not in low:
+            continue
+        parsed = parse_altar_log(ftext)
+        log_date = fwd.get("date") or time.time()
+        contributors, note = pick_altar_contributors(log_date)
+        send_msg(peer_id, build_altar_report(parsed, user_id, contributors, note))
+        print(f"🏛 Лог алтаря разобран для {user_id}: предметов {len(parsed['items'])}")
+        return True
+    return False
+
+
+def handle_reward_price_command(peer_id, user_id, text):
+    """/награда Название цена (админ): цена награды алтаря. /награды: список цен."""
+    parts = text.strip().split(None, 1)
+    head = parts[0].lower() if parts else ""
+    if head not in ("/награда", "/награды"):
+        return False
+    if user_id != ADMIN_ID:
+        send_msg(peer_id, "⛔ У вас нет доступа к этой команде.")
+        return True
+    body = parts[1] if len(parts) > 1 else ""
+    if head == "/награды" or not body.strip():
+        with reward_lock:
+            rows = sorted(reward_prices.items(), key=lambda kv: -kv[1])
+        lines = ["🏺 Цены наград алтаря (покупка):"] + [f"• {k.capitalize()}: {money_fmt(v)}" for k, v in rows]
+        lines += ["", "Изменить или добавить: /награда Название цена"]
+        send_msg(peer_id, "\n".join(lines))
+        return True
+    m = re.match(r"^(.+?)\s+(\d[\d\s]*)$", body.strip())
+    key = norm_item(m.group(1)) if m else ""
+    if not m or not key:
+        send_msg(peer_id, "⚠️ Формат: /награда Фрейм познания 186269")
+        return True
+    price = int(re.sub(r"\s", "", m.group(2)))
+    with reward_lock:
+        reward_prices[key] = price
+        _save_reward_prices()
+    send_msg(peer_id, f"✅ {key.capitalize()}: {money_fmt(price)}")
+    return True
 
 
 # ==========================================
@@ -1357,7 +1621,9 @@ HELP_USER = (
     "🗑 /отмена [босс | исследование | свои] — отменить таймеры\n"
     "🧬 Жетон: бот сам ответит на выданный в чате (или на пересланный), напишет, сколько родных статов добавилось с прошлого раза и сколько осталось до капа\n"
     "🔐 Терминал с шифром просто перешлите сюда: бот пришлёт ответ и через минуту всё удалит\n"
-    "📜 /статус — сколько рун собрано\n"
+    "📜 /статус — сколько рун собрано и кто какую внёс\n"
+    "🏛 /алтарь — кто вносил руны в этот и в прошлый алтарь\n"
+    "💸 Вскрыли алтарь? Перешлите сюда лог «Ритуал завершён»: бот посчитает награды и выплаты за руны\n"
     "🏓 /пинг — проверить, что бот жив"
 )
 
@@ -1366,6 +1632,7 @@ HELP_ADMIN = (
     "\n"
     "🧽 дел — ответом на чужое сообщение: бот удалит его и вашу команду (нужны права админа беседы)\n"
     "💾 /код — все собранные коды рун\n"
+    "🏺 /награда Фрейм познания 190000 — цена награды алтаря, /награды — список цен\n"
     "➕ /add <аспект> <код> — внести руну вручную\n"
     "➖ /удалить <аспект> — удалить одну руну\n"
     "🗑 /очистить — очистить базу рун\n"
@@ -2629,6 +2896,16 @@ def handle_message(msg):
         send_msg(peer_id, status_msg)
         return
 
+    if clean_text in ["/алтарь", "/altar"]:
+        with data_lock:
+            now_runes = dict(runes)
+            last = dict(altar_last)
+        parts = [contributors_text("🏛 Алтарь сейчас", now_runes)]
+        if last.get("runes"):
+            parts.append(contributors_text("🗂 Прошлый алтарь", last["runes"], last.get("time")))
+        send_msg(peer_id, "\n\n".join(parts))
+        return
+
     if clean_text in ["/пинг", "/ping"]:
         uptime_sec = int(time.time() - START_TIME)
         hours, remainder = divmod(uptime_sec, 3600)
@@ -2661,6 +2938,10 @@ def handle_message(msg):
             return
         if handle_price_command(peer_id, user_id, text):
             return
+        if handle_reward_price_command(peer_id, user_id, text):
+            return
+        if handle_altar_log(msg, peer_id, user_id, fwd_messages):
+            return
         if handle_cipher_forward(msg, peer_id, user_id, fwd_messages):
             return
         if handle_token_forward(msg, peer_id, user_id, fwd_messages):
@@ -2692,7 +2973,9 @@ def handle_message(msg):
                         code_val = val.get("code", "???") if isinstance(val, dict) else str(val)
                         t_val = val.get("time", 0) if isinstance(val, dict) else 0
                         t_str = time.strftime("%H:%M", time.localtime(t_val)) if t_val else "время не указано"
-                        lines.append(f"• {a}: {code_val} (в {t_str})")
+                        owner = rune_owner(val)
+                        who = f", внёс {get_full_name(owner)}" if owner else ""
+                        lines.append(f"• {a}: {code_val} (в {t_str}{who})")
                     else:
                         lines.append(f"• {a}: *нет*")
             msg_text = "💾 Все собранные коды (Админ):\n\n" + "\n".join(lines)
@@ -2731,7 +3014,7 @@ def handle_message(msg):
             trigger_broadcast = False
             with data_lock:
                 was_complete = len(runes) == len(ASPECTS)
-                runes[aspect] = {"code": code, "time": time.time()}
+                store_rune(aspect, code, time.time(), user_id)
                 save_data(runes)
                 status_str = get_status_text(runes)
 
@@ -2851,6 +3134,7 @@ def handle_message(msg):
 
             with data_lock:
                 old_count = len(runes)
+                snapshot_altar()
                 runes.clear()
                 last_reset_time = time.time()
                 save_data(runes)
@@ -2991,7 +3275,7 @@ def handle_message(msg):
                         trigger_broadcast = False
                         with data_lock:
                             was_complete = len(runes) == len(ASPECTS)
-                            runes[aspect] = {"code": code, "time": fwd_date}
+                            first_u, was_present = store_rune(aspect, code, fwd_date, user_id)
                             save_data(runes)
                             status_str = get_status_text(runes)
 
@@ -2999,6 +3283,8 @@ def handle_message(msg):
                                 trigger_broadcast = True
 
                         response_msg = f"✅ Аспект «{aspect}» сохранен!\n\n{status_str}"
+                        if was_present and first_u != user_id:
+                            response_msg += f"\n\nℹ️ Эту руну уже вносил(а) {get_full_name(first_u)}, авторство за ним(ней)."
                         send_msg(peer_id, response_msg)
                         delete_msg(msg.get("id"))
 
@@ -3019,6 +3305,8 @@ load_stats()
 load_timers()
 load_cipher_words()
 load_tiers()
+load_altar()
+load_reward_prices()
 load_prices()
 load_tokens()
 
