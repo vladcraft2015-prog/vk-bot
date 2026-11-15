@@ -544,6 +544,50 @@ def handle_altar_log(msg, peer_id, user_id, fwd_messages):
     return False
 
 
+RE_SHOP_ROW = re.compile(
+    r"([А-Яа-яЁё][А-Яа-яЁё ]*?)\s*[×xхX]\s*\d+\s*Покупка\s*/\s*продажа:\s*(\d[\d ]*)", re.I
+)
+RE_PRICE_LINE = re.compile(r"^\s*(.+?)\s*[-—–:=]*\s*(\d[\d ]*)\s*$")
+
+
+def apply_reward_prices(text):
+    """Цены из текста: строки «Название цена» или сообщения магазина «Название × 1 / Покупка/продажа: A / B»
+    (берётся первое число, цена покупки). Возвращает список (название, цена)."""
+    found = []
+    flat = re.sub(r"\s+", " ", text)
+    for m in RE_SHOP_ROW.finditer(flat):
+        key = norm_item(m.group(1))
+        if key:
+            found.append((key, int(re.sub(r"\s", "", m.group(2)))))
+    if not found:
+        for raw in text.splitlines():
+            m = RE_PRICE_LINE.match(raw)
+            key = norm_item(m.group(1)) if m else ""
+            if key:
+                found.append((key, int(re.sub(r"\s", "", m.group(2)))))
+    if found:
+        with reward_lock:
+            for key, price in found:
+                reward_prices[key] = price
+            _save_reward_prices()
+    return found
+
+
+def handle_reward_forward(msg, peer_id, user_id, fwd_messages):
+    """Админ переслал сообщения магазина с ценами: обновляем цены разом."""
+    if user_id != ADMIN_ID:
+        return False
+    chunks = [f.get("text") or "" for f in fwd_messages if "покупка/продажа" in (f.get("text") or "").lower()]
+    if not chunks:
+        return False
+    found = apply_reward_prices("\n".join(chunks))
+    if not found:
+        return False
+    lines = [f"✅ Цены наград обновлены: {len(found)}"] + [f"• {k.capitalize()}: {money_fmt(p)}" for k, p in found]
+    send_msg(peer_id, "\n".join(lines))
+    return True
+
+
 def handle_reward_price_command(peer_id, user_id, text):
     """/награда Название цена (админ): цена награды алтаря. /награды: список цен."""
     parts = text.strip().split(None, 1)
@@ -561,16 +605,14 @@ def handle_reward_price_command(peer_id, user_id, text):
         lines += ["", "Изменить или добавить: /награда Название цена"]
         send_msg(peer_id, "\n".join(lines))
         return True
-    m = re.match(r"^(.+?)\s+(\d[\d\s]*)$", body.strip())
-    key = norm_item(m.group(1)) if m else ""
-    if not m or not key:
-        send_msg(peer_id, "⚠️ Формат: /награда Фрейм познания 186269")
+    found = apply_reward_prices(body)
+    if not found:
+        send_msg(peer_id, "⚠️ Формат: /награда Фрейм познания 186269 (можно несколько строк сразу)")
         return True
-    price = int(re.sub(r"\s", "", m.group(2)))
-    with reward_lock:
-        reward_prices[key] = price
-        _save_reward_prices()
-    send_msg(peer_id, f"✅ {key.capitalize()}: {money_fmt(price)}")
+    if len(found) == 1:
+        send_msg(peer_id, f"✅ {found[0][0].capitalize()}: {money_fmt(found[0][1])}")
+    else:
+        send_msg(peer_id, f"✅ Обновлено цен: {len(found)}\n" + "\n".join(f"• {k.capitalize()}: {money_fmt(p)}" for k, p in found))
     return True
 
 
@@ -1632,7 +1674,8 @@ HELP_ADMIN = (
     "\n"
     "🧽 дел — ответом на чужое сообщение: бот удалит его и вашу команду (нужны права админа беседы)\n"
     "💾 /код — все собранные коды рун\n"
-    "🏺 /награда Фрейм познания 190000 — цена награды алтаря, /награды — список цен\n"
+    "🏺 /награда Фрейм познания 190000 — цена награды алтаря (можно списком, по строке на фрейм), /награды — список цен\n"
+    "🏺 Цены магазина: перешлите сюда сообщения «Фрейм … × 1 / Покупка/продажа», бот обновит цены сам\n"
     "➕ /add <аспект> <код> — внести руну вручную\n"
     "➖ /удалить <аспект> — удалить одну руну\n"
     "🗑 /очистить — очистить базу рун\n"
@@ -2942,6 +2985,8 @@ def handle_message(msg):
             return
         if handle_altar_log(msg, peer_id, user_id, fwd_messages):
             return
+        if handle_reward_forward(msg, peer_id, user_id, fwd_messages):
+            return
         if handle_cipher_forward(msg, peer_id, user_id, fwd_messages):
             return
         if handle_token_forward(msg, peer_id, user_id, fwd_messages):
@@ -3011,20 +3056,27 @@ def handle_message(msg):
                 )
                 return
 
+            # Кому записать руну: если /add написан ответом на чужое сообщение, то автору этого сообщения,
+            # иначе тому, кто написал /add. Если руну уже кто-то вносил, авторство остаётся у первого.
+            reply_author = (msg.get("reply_message") or {}).get("from_id")
+            credit_id = reply_author if isinstance(reply_author, int) and reply_author > 0 else user_id
+
             trigger_broadcast = False
             with data_lock:
                 was_complete = len(runes) == len(ASPECTS)
-                store_rune(aspect, code, time.time(), user_id)
+                first_u, was_present = store_rune(aspect, code, time.time(), credit_id)
                 save_data(runes)
                 status_str = get_status_text(runes)
 
                 if len(runes) == len(ASPECTS) and not was_complete:
                     trigger_broadcast = True
 
-            send_msg(
-                peer_id,
-                f"✅ Аспект «{aspect}» установлен вручную!\n\n{status_str}",
-            )
+            response_msg = f"✅ Аспект «{aspect}» установлен вручную!\n\n{status_str}"
+            if was_present and first_u != credit_id:
+                response_msg += f"\n\nℹ️ Эту руну уже вносил(а) {get_full_name(first_u)}, авторство за ним(ней)."
+            elif credit_id != user_id:
+                response_msg += f"\n\n👤 Руна записана на {get_full_name(credit_id)}."
+            send_msg(peer_id, response_msg)
 
             if trigger_broadcast:
                 broadcast_notification()
